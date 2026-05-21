@@ -1,0 +1,826 @@
+---
+title: "Building a Payment Gateway"
+description: "A complete guide to building a robust IXI payment gateway using QuIXI for accepting and sending payments."
+---
+
+Building a payment gateway for the Ixian network is straightforward with **QuIXI**, the lightweight Ixian gateway node. By leveraging QuIXI's REST API and message queue integration, you can accept and send IXI payments from web portals, online services, exchanges, or any backend system, without implementing the Ixian P2P protocol yourself.
+
+## Architecture Overview
+
+A typical IXI payment gateway implements two primary flows:
+
+1. **Receive:** Generate unique deposit addresses for each user via Extended Addresses, listen for incoming transactions in real-time (MQTT) or via polling, and wait for network confirmation before crediting accounts.
+2. **Send:** Resolve a user-provided Ixian address and broadcast a transaction through QuIXI.
+
+QuIXI abstracts all blockchain interactions, providing:
+- A **JSON-RPC API** for address management, transactions, and activity queries
+- **MQTT** integration for real-time payment event streaming
+
+---
+
+## Preparation
+
+### 1. Install and Configure QuIXI
+
+## Installation
+
+### Prerequisites
+- .NET 10.0 SDK or later
+- MQTT broker (Mosquitto)
+- Access to Ixian testnet or mainnet
+
+### Building from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/ixian-platform/QuIXI.git
+cd QuIXI
+
+# Build
+dotnet build --configuration Release
+
+# Run
+cd QuIXI/bin/Release/net10.0
+./QuIXI
+```
+
+On first run, QuIXI will generate a wallet.
+
+### Windows
+
+```powershell
+# Build
+dotnet build --configuration Release
+
+# Run
+cd QuIXI\bin\Release\net10.0
+.\QuIXI.exe
+```
+
+## Configuration
+
+Configure `ixian.cfg` with the settings relevant to a payment gateway:
+
+```ini
+# Network
+networkType = mainnet
+# addPeer = seed1.ixian.io:10234
+
+# API settings
+apiPort = 8001
+apiBind = http://127.0.0.1:8001/
+apiAllowIp = 127.0.0.1
+# addApiUser = admin:your_secure_password
+
+# Message Queue (recommended for real-time payment events)
+mqDriver = mqtt
+mqHost = localhost
+mqPort = 1883
+
+# Stream capabilities - set only incoming
+streamCapabilities = 1
+
+# Logging
+logVerbosity = 14
+```
+
+> **Security:** Always use strong API credentials, bind to `127.0.0.1` in production, and proxy through a TLS-terminated reverse proxy (e.g., Nginx) for external access.
+
+### 2. Wire Your Backend to QuIXI
+
+Your backend system will interact with QuIXI in two ways:
+
+- **HTTP requests** to QuIXI's JSON-RPC API for operations like generating addresses (`/extendAddress`), resolving addresses (`/resolveExtendedAddress`), sending transactions (`/addTransaction`), and querying activity (`/activity2`, `/getActivity`).
+- **Message queue subscriptions** (MQTT) for real-time payment event delivery. Alternatively you can poll the `/activity2` endpoint.
+
+---
+
+## Flow 1: Receiving Payments
+
+The receive flow enables users to deposit or pay with IXI. We use **Extended Addresses** to uniquely tag each payment, allowing a single wallet to safely manage funds for many users.
+
+### Step 1: Generate a Payment Address
+
+When a user wants to deposit funds, your backend requests a unique extended address from QuIXI using the `/extendAddress` endpoint.
+
+**API: `/extendAddress`**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `flag` | integer | Yes | Address type: `1` = E2E, `2` = OfflineTag, `3` = OfflineAddress |
+| `tag` | string | Yes | Hex-encoded tag (max 16 bytes) — use this to identify the user/order |
+| `paymentAddress` | string | Only for `flag=3` | A separate payment address (for OfflineAddress mode) |
+
+**Address types explained:**
+- **E2E (flag=1):** Best for always-online services. The sender connects to your node and requests payment instructions before sending, enabling one-time payment addresses for better privacy.
+- **OfflineTag (flag=2):** The sender can pay without your service being online. The tag is embedded in the address to identify the payment. Ideal for mobile-friendly payment pages.
+- **OfflineAddress (flag=3):** Like OfflineTag, but uses a separate on-chain payment address generated per user, providing better privacy.
+
+For most online payment gateways, **E2E** or **OfflineTag** are recommended.
+
+```bash
+# Generate an E2E extended address with a user-specific tag
+# Tag is a hex-encoded string (e.g., hex of "user123" or a unique order ID)
+curl "http://127.0.0.1:8001/extendAddress?flag=1&tag=75736572313233"
+```
+
+**Response:**
+
+```json
+{
+  "result": "4nHMRz...base58address..._2EfGh...extendedData...",
+  "error": null
+}
+```
+
+The `result` is the full extended address string. Store the mapping between the tag and your user/order in your database, then display this address (and/or a QR code of it) to the user.
+
+### Step 2: Display to the User
+
+Present the extended address to the user in your web portal:
+- Display the address as a **copyable string**
+- Render a **QR code** encoding the extended address
+- The user scans or copy-pastes this address into **Spixi** or another IXI client and initiates the transfer
+
+### Step 3: Listen for Payments
+
+Once the user sends their payment, your backend needs to detect the incoming transaction.
+
+#### Option A: MQTT (Recommended for Real-Time)
+
+Subscribe to the `Transaction` and `TransactionStatusUpdate` topics on your MQTT broker. QuIXI publishes to these topics whenever a transaction is detected or its status changes.
+
+**Key MQ topics for payment gateways:**
+
+| Topic | Published When | Payload |
+|---|---|---|
+| `Transaction` | A new transaction is detected (incoming or outgoing) | Full transaction object |
+| `TransactionStatusUpdate` | Transaction status changes (verified, rejected, expired, reverted) | `{ "txid": "status" }` |
+| `SentFunds` | A P2P payment notification is received via streaming | Stream message with tx ID |
+
+When you receive a `Transaction` event, extract the `toList` entries and match the recipient address/tag against your database to identify which user the payment belongs to.
+
+#### Option B: Polling via `/activity2`
+
+Poll the `/activity2` endpoint periodically to check for new incoming transactions.
+
+**API: `/activity2`**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `type` | integer | all | Activity type filter: `100` = received, `101` = sent |
+| `count` | integer | `50` | Number of activities to return |
+| `fromId` | string | — | activity ID for pagination |
+| `descending` | string | `false` | Set to `"false"` for oldest-first ordering |
+
+```bash
+# Poll for recent incoming transactions (type 100 = TransactionReceived)
+curl "http://127.0.0.1:8001/activity2?type=100&count=10&descending=false"
+```
+
+**Response:**
+
+```json
+{
+  "result": [
+    {
+      "id": "3-abcdef...",
+      "type": 100,
+      "status": 1,
+      "timestamp": 1716220000,
+      "value": "50.00000000",
+      "fee": "0.00010000",
+      "fromAddressList": { "4nHMRz...sender...": "50.00010000" },
+      "toAddressList": { "4nHMRz...your_address...": "50.00000000" },
+      "appliedBlockHeight": 0
+    }
+  ],
+  "error": null
+}
+```
+
+### Step 4: Wait for Confirmation
+
+Before crediting the user's account, wait for the transaction to be **confirmed** by the network.
+
+#### Via MQTT
+
+Subscribe to the `TransactionStatusUpdate` topic. When QuIXI verifies a transaction against the blockchain, it publishes:
+
+```json
+{ "3-abcdef1234...": "verified" }
+```
+
+Possible status values:
+
+| Status | Meaning | Action |
+|---|---|---|
+| `verified` | Transaction confirmed on-chain | ✅ Credit the user's account |
+| `rejected` | Transaction rejected by the network | ❌ Do not credit |
+| `expired` | Transaction expired without confirmation | ❌ Do not credit |
+| `reverted` | Transaction was reverted (block reorganization) | ⚠️ Reverse any credit |
+
+#### Via Polling `/getActivity`
+
+Poll the `/getActivity` endpoint with the transaction ID to check its current status.
+
+Match the addresses in `transaction.toList` and its `.data` field against your stored  address mappings and tag respectively to identify the user.
+
+**API: `/getActivity`**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `id` | string | Yes | Transaction ID |
+
+```bash
+curl "http://127.0.0.1:8001/getActivity?id=txid"
+```
+
+**Response:**
+
+```json
+{
+  "result": {
+    "id": "5938914-ssPPYPwBiKfHBE9Xntp4fBXwCJYitzKTzSta425VB94EKMjRoUmv7n66CFQE",
+    "seedHash": "AVr8pK+MQIGQ2iieR59mvw==",
+    "type": 100,
+    "timestamp": 1779302126,
+    "status": 2,
+    "fromAddressList": {
+      "5FZf4fb11tduchtHxzfp5n6jA8bvod1NXQSoaujZvA3Z6LD6ZM1WpNQAXExhbE1yr": "10.03000000"
+    },
+    "toAddressList": {
+      "3tFzB7DygYiyjfZ9RbHaZJNaPGgF25E8otFbM3rGMkTC98feQdKDBw4MKzfg48E3L": "10.00000000"
+    },
+    "value": "10.00000000",
+    "fee": "0.01000000",
+    "appliedBlockHeight": 5938917,
+    "transaction": {
+      "version": 7,
+      "id": "Af3inloAnHP5TTimjZxh/rAHT32S7F+I0uyFZ6auL+TIA10XEWQdXGwSLYO1JY0kK6M=",
+      "type": 0,
+      "amount": {
+        "amount": 1002000000
+      },
+      "fee": {
+        "amount": 1000000
+      },
+      "fromList": {
+        "AA==": {
+          "amount": 1003000000
+        }
+      },
+      "toList": {
+        "3tFzB7DygYiyjfZ9RbHaZJNaPGgF25E8otFbM3rGMkTC98feQdKDBw4MKzfg48E3L": {
+          "amount": {
+            "amount": 1000000000
+          },
+          "data": "dXNlcjEyMw==",
+          "dataChecksum": "+rH10RK6ZQ+Ma30JBfLl6THb6AJRNrFjLXyOQMcrE6c="
+        },
+        "3TA9meGrkwoX8fJzQReuF1sxLZkNyRgbUKqJysfy6vqshAoMVAzvQKXgAkbJDaCNA": {
+          "amount": {
+            "amount": 1000000
+          },
+          "data": null,
+          "dataChecksum": null
+        },
+        "4oBtGYZBJwGUD7RaxHigXva73Hyd2ZKTtCZ8QhhDDfGhd6dCQZJuBom15BwxQu61T": {
+          "amount": {
+            "amount": 1000000
+          },
+          "data": null,
+          "dataChecksum": null
+        }
+      },
+      "blockHeight": 5938914,
+      "nonce": 59250,
+      "timeStamp": 0,
+      "checksum": "...",
+      "signature": "...",
+      "pubKey": { ... },
+      "readyToApply": 0,
+      "applied": 5938917,
+      "fromLocalStorage": false,
+      "powVerified": false,
+      "powSolution": null
+    }
+  },
+  "error": null,
+  "id": null
+}
+```
+
+**Activity status codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| `1` | Pending | Transaction seen but not yet confirmed |
+| `2` | Final | ✅ Transaction confirmed - safe to credit |
+| `3` | Expired | Transaction expired |
+| `4` | Reverted | Transaction was reverted |
+| `5` | Rejected | Transaction rejected |
+| `6` | Unknown | Transaction status cannot be verified |
+
+Only credit the user's account when `status` is `2` (Final).
+
+---
+
+## Flow 2: Sending Payments
+
+The send flow allows your service to send IXI to users — for example, processing withdrawals.
+
+### Step 1: Resolve the Address
+
+When a user provides their Ixian address (which may be an extended address), resolve it first using `/resolveExtendedAddress`. This validates the address and extracts routing and payment information needed for delivery.
+
+**API: `/resolveExtendedAddress`**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `extendedAddress` | string | Yes | The recipient's extended address string |
+| `amount` | string | No | The amount to send (used for E2E payment instruction negotiation) |
+
+```bash
+curl "http://127.0.0.1:8001/resolveExtendedAddress?extendedAddress=4nHMRz..._2EfGh...&amount=100"
+```
+
+**Response:**
+
+```json
+{
+  "result": "4nHMRz...resolved_address..._3XyZ...",
+  "error": null
+}
+```
+
+> **Note:** For E2E addresses, the resolve step contacts the recipient to negotiate a one-time payment address. The recipient must be online for this to succeed.
+
+### Step 2: Send the Transaction
+
+Use the `/addTransaction` endpoint to broadcast the payment. The `to` parameter uses the format `extendedAddress_amount`.
+
+**API: `/addTransaction`**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `to` | string | Yes | `address_amount` - use the resolved address along with the amount that you want to send |
+| `autofee` | string | No | Set to `"true"` to let QuIXI calculate the optimal fee |
+
+```bash
+# Send 100 IXI to the address
+curl "http://127.0.0.1:8001/addTransaction?to=4nHMRz..._3XyZ..._100&autofee=true"
+```
+
+**Response:**
+
+```json
+{
+  "result": {
+    "id": "3-abc123...",
+    "version": 10,
+    "type": 0,
+    "amount": "100.00000000",
+    "fee": "0.00010000",
+    "toList": { "4nHMRz...": "100.00000000" },
+    "fromList": { "..." : "100.00010000" },
+    "applied": 0
+  },
+  "error": null
+}
+```
+
+The transaction is now signed and broadcast to the Ixian network. You can monitor its confirmation via `TransactionStatusUpdate` on MQTT or by polling `/getActivity`.
+
+---
+
+## Complete Examples
+
+### Python Example
+
+```python
+import requests
+import paho.mqtt.client as mqtt
+import json
+import time
+import threading
+
+QUIXI_API = "http://127.0.0.1:8001"
+
+# ============================================================
+# RECEIVE FLOW
+# ============================================================
+
+def generate_deposit_address(user_tag_hex):
+    """
+    Generate a unique extended address for a user deposit.
+
+    Args:
+        user_tag_hex: Hex-encoded tag (max 16 bytes) identifying the user/order.
+                      Example: "75736572313233" (hex of "user123")
+    Returns:
+        The extended address string, or None on error.
+    """
+    response = requests.get(f"{QUIXI_API}/extendAddress", params={
+        "flag": "1",        # E2E — best for online services
+        "tag": user_tag_hex
+    })
+    data = response.json()
+    if data.get("error"):
+        print(f"Error generating address: {data['error']}")
+        return None
+    address = data["result"]
+    print(f"Generated deposit address: {address}")
+    return address
+
+
+def poll_incoming_payments(last_from_id=None):
+    """
+    Poll /activity2 for recent incoming transactions.
+
+    Args:
+        last_from_id: ID of the last seen activity (for pagination).
+    Returns:
+        List of activity objects.
+    """
+    params = {
+        "type": "100",         # 100 = TransactionReceived
+        "count": "20",
+        "descending": "false"
+    }
+    if last_from_id:
+        params["fromId"] = last_from_id
+
+    response = requests.get(f"{QUIXI_API}/activity2", params=params)
+    data = response.json()
+    activities = data.get("result", [])
+
+    for activity in activities:
+        tx_id = activity.get("id")
+        value = activity.get("value")
+        status = activity.get("status")
+        to_list = activity.get("toAddressList", {})
+        print(f"  TX {tx_id}: {value} IXI (status={status})")
+        # Match 'to_list' addresses/tags against your user database
+    return activities
+
+
+def wait_for_confirmation(tx_id, timeout=600, interval=10):
+    """
+    Poll /getActivity until the transaction reaches a final status.
+
+    Args:
+        tx_id: transaction ID.
+        timeout: Maximum seconds to wait.
+        interval: Seconds between polls.
+    Returns:
+        True if confirmed (Final), False otherwise.
+    """
+    elapsed = 0
+    while elapsed < timeout:
+        response = requests.get(f"{QUIXI_API}/getActivity", params={
+            "id": tx_id
+        })
+        data = response.json()
+        activity = data.get("result")
+        if activity:
+            status = activity.get("status")
+            if status == 2:  # Final
+                print(f"Transaction confirmed at block {activity.get('appliedBlockHeight')}")
+                return True
+            elif status in (3, 4, 5):  # Expired, Reverted, Rejected
+                print(f"Transaction failed with status {status}")
+                return False
+        time.sleep(interval)
+        elapsed += interval
+    print("Timeout waiting for confirmation")
+    return False
+
+
+# ============================================================
+# SEND FLOW
+# ============================================================
+
+def send_payment(to_extended_address, amount):
+    """
+    Send IXI to a user's extended address.
+
+    Args:
+        to_extended_address: The recipient's extended address string.
+        amount: Amount of IXI to send (as string or number).
+    Returns:
+        Transaction result dict, or None on error.
+    """
+    # Step 1: Resolve the extended address
+    resolve_resp = requests.get(f"{QUIXI_API}/resolveExtendedAddress", params={
+        "extendedAddress": to_extended_address,
+        "amount": str(amount)
+    })
+    resolve_data = resolve_resp.json()
+    if resolve_data.get("error"):
+        print(f"Error resolving address: {resolve_data['error']}")
+        return None
+
+    resolved_address = resolve_data["result"]
+    print(f"Address resolved: {resolved_address}")
+
+    # Step 2: Send the transaction
+    # Format: resolvedAddress_amount
+    to_param = f"{resolved_address}_{amount}"
+    tx_resp = requests.get(f"{QUIXI_API}/addTransaction", params={
+        "to": to_param,
+        "autofee": "true"
+    })
+    tx_data = tx_resp.json()
+    if tx_data.get("error"):
+        print(f"Error sending transaction: {tx_data['error']}")
+        return None
+
+    result = tx_data["result"]
+    print(f"Transaction sent! ID: {result.get('id')}")
+    return result
+
+
+# ============================================================
+# MQTT LISTENER (Real-Time Payment Events)
+# ============================================================
+
+def start_mqtt_listener(broker="localhost", port=1883):
+    """
+    Start an MQTT listener for real-time payment events.
+    Subscribes to Transaction and TransactionStatusUpdate topics.
+    """
+    def on_connect(client, userdata, flags, rc):
+        print(f"Connected to MQTT broker (rc={rc})")
+        client.subscribe("Transaction/#")
+        client.subscribe("TransactionStatusUpdate/#")
+        print("Subscribed to Transaction, TransactionStatusUpdate")
+
+    def on_message(client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode())
+        except Exception:
+            payload = msg.payload.decode()
+
+        if msg.topic == "Transaction":
+            print(f"\n[MQ] New transaction detected:")
+            print(f"     {json.dumps(payload, indent=2, default=str)}")
+            # Extract toList and match against your user database
+
+        elif msg.topic == "TransactionStatusUpdate":
+            print(f"\n[MQ] Transaction status update:")
+            for tx_id, status in payload.items():
+                print(f"     TX {tx_id} -> {status}")
+                if status == "verified":
+                    print("     -> Credit user account")
+                elif status in ("rejected", "expired"):
+                    print("     -> Do NOT credit")
+                elif status == "reverted":
+                    print("     -> Reverse any credit")
+
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(broker, port, 60)
+
+    # Run in a background thread
+    thread = threading.Thread(target=client.loop_forever, daemon=True)
+    thread.start()
+    return client
+
+
+# ============================================================
+# USAGE
+# ============================================================
+
+if __name__ == "__main__":
+    # Start real-time listener
+    mqtt_client = start_mqtt_listener()
+    print("MQTT listener started in background\n")
+
+    # Generate a deposit address for user "user123"
+    user_tag = "75736572313233"  # hex("user123")
+    deposit_address = generate_deposit_address(user_tag)
+
+    # Poll for payments (alternative to MQTT)
+    print("\nPolling for incoming payments...")
+    poll_incoming_payments()
+
+    # Send a payment (example - uncomment to use)
+    # send_payment("4nHMRz...recipient_address..._2EfGh...", 100)
+
+    # Keep main thread alive for MQTT
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+```
+
+### Node.js Example
+
+```javascript
+const axios = require('axios');
+const mqtt = require('mqtt');
+
+const QUIXI_API = 'http://127.0.0.1:8001';
+
+// ============================================================
+// RECEIVE FLOW
+// ============================================================
+
+async function generateDepositAddress(userTagHex) {
+    /**
+     * Generate a unique extended address for a user deposit.
+     * @param {string} userTagHex - Hex-encoded tag (max 16 bytes)
+     */
+    try {
+        const { data } = await axios.get(`${QUIXI_API}/extendAddress`, {
+            params: { flag: '1', tag: userTagHex }
+        });
+        if (data.error) throw new Error(data.error.message);
+        console.log(`Generated deposit address: ${data.result}`);
+        return data.result;
+    } catch (error) {
+        console.error('Error generating address:', error.message);
+        return null;
+    }
+}
+
+async function pollIncomingPayments(lastFromId = null) {
+    /**
+     * Poll /activity2 for recent incoming transactions.
+     */
+    const params = { type: '100', count: '20', descending: 'false' };
+    if (lastFromId) params.fromId = lastFromId;
+
+    try {
+        const { data } = await axios.get(`${QUIXI_API}/activity2`, { params });
+        const activities = data.result || [];
+
+        for (const activity of activities) {
+            console.log(`  TX ${activity.id}: ${activity.value} IXI (status=${activity.status})`);
+            // Match toAddressList against your user database
+        }
+        return activities;
+    } catch (error) {
+        console.error('Error polling activities:', error.message);
+        return [];
+    }
+}
+
+async function waitForConfirmation(txId, timeoutMs = 600000, intervalMs = 10000) {
+    /**
+     * Poll /getActivity until the transaction reaches a final status.
+     */
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const { data } = await axios.get(`${QUIXI_API}/getActivity`, {
+                params: { id: txId }
+            });
+            const activity = data.result;
+            if (activity) {
+                if (activity.status === 2) { // Final
+                    console.log(`Transaction confirmed at block ${activity.appliedBlockHeight}`);
+                    return true;
+                } else if ([3, 4, 5].includes(activity.status)) {
+                    console.log(`Transaction failed with status ${activity.status}`);
+                    return false;
+                }
+            }
+        } catch (error) {
+            console.error('Error checking status:', error.message);
+        }
+        await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+    console.log('Timeout waiting for confirmation');
+    return false;
+}
+
+// ============================================================
+// SEND FLOW
+// ============================================================
+
+async function sendPayment(toExtendedAddress, amount) {
+    /**
+     * Send IXI to a user's extended address.
+     */
+    try {
+        // Step 1: Resolve the extended address
+        const resolveResp = await axios.get(`${QUIXI_API}/resolveExtendedAddress`, {
+            params: { extendedAddress: toExtendedAddress, amount: String(amount) }
+        });
+        if (resolveResp.data.error) throw new Error(resolveResp.data.error.message);
+
+        const resolvedAddress = resolveResp.data.result;
+        console.log(`Address resolved: ${resolvedAddress}`);
+
+        // Step 2: Send the transaction (format: resolvedAddress_amount)
+        const toParam = `${resolvedAddress}_${amount}`;
+        const txResp = await axios.get(`${QUIXI_API}/addTransaction`, {
+            params: { to: toParam, autofee: 'true' }
+        });
+        if (txResp.data.error) throw new Error(txResp.data.error.message);
+
+        console.log(`Transaction sent! ID: ${txResp.data.result.id}`);
+        return txResp.data.result;
+    } catch (error) {
+        console.error('Error sending payment:', error.message);
+        return null;
+    }
+}
+
+// ============================================================
+// MQTT LISTENER (Real-Time Payment Events)
+// ============================================================
+
+function startMqttListener(brokerUrl = 'mqtt://localhost:1883') {
+    const client = mqtt.connect(brokerUrl);
+
+    client.on('connect', () => {
+        console.log('Connected to MQTT broker');
+        client.subscribe(['Transaction', 'TransactionStatusUpdate']);
+        console.log('Subscribed to Transaction, TransactionStatusUpdate');
+    });
+
+    client.on('message', (topic, payload) => {
+        let message;
+        try {
+            message = JSON.parse(payload.toString());
+        } catch {
+            message = payload.toString();
+        }
+
+        if (topic === 'Transaction') {
+            console.log('\n[MQ] New transaction detected:');
+            console.log('    ', JSON.stringify(message, null, 2));
+            // Extract toList and match against your user database
+
+        } else if (topic === 'TransactionStatusUpdate') {
+            console.log('\n[MQ] Transaction status update:');
+            for (const [txId, status] of Object.entries(message)) {
+                console.log(`     TX ${txId} -> ${status}`);
+                if (status === 'verified') {
+                    console.log('     -> Credit user account');
+                } else if (['rejected', 'expired'].includes(status)) {
+                    console.log('     -> Do NOT credit');
+                } else if (status === 'reverted') {
+                    console.log('     -> Reverse any credit');
+                }
+            }
+        }
+    });
+
+    return client;
+}
+
+// ============================================================
+// USAGE
+// ============================================================
+
+(async () => {
+    // Start real-time listener
+    const mqttClient = startMqttListener();
+    console.log('MQTT listener started\n');
+
+    // Generate a deposit address for user "user123"
+    const userTag = '75736572313233'; // hex("user123")
+    const depositAddress = await generateDepositAddress(userTag);
+
+    // Poll for payments (alternative to MQTT)
+    console.log('\nPolling for incoming payments...');
+    await pollIncomingPayments();
+
+    // Send a payment (example - uncomment to use)
+    // await sendPayment('4nHMRz...recipient_address..._2EfGh...', 100);
+})();
+```
+
+---
+
+## Best Practices
+
+### Security
+- **Never expose QuIXI's API directly** to the internet. Place it behind a reverse proxy with TLS.
+- Use strong, unique `addApiUser` credentials.
+- Store your wallet file securely, it contains private keys.
+
+### Reliability
+- **Always wait for `Final` status** (status code `2`) before crediting accounts. Pending transactions can still be rejected or expire.
+- Handle **block reorganizations** (`reverted` status) by reversing any credits.
+- Implement **idempotent processing** - track processed transaction IDs to avoid double-crediting.
+
+### Scalability
+- Use **MQTT** instead of polling for high-volume payment gateways.
+- Use unique tags per user/order and simplify payment matching.
+- The tag field supports up to **16 bytes**, providing ample space for order IDs or user identifiers.
+
+---
+
+## Next Steps
+
+- Explore the [RPC API Reference](../../reference/common/rpc_v0) for detailed endpoint documentation.
+- Read more about [Extended Addresses](../../architecture/10_data-structures/extended-addresses) to understand address types, routing, and tagging.
+- Review the [QuIXI MQ Topics](../../reference/quixi/mq) for a full list of real-time event topics.
+- Check out the [QuIXI Bridge Reference](../../reference/quixi) for general documentation about QuIXI.

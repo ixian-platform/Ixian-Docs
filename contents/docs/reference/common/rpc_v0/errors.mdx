@@ -1,0 +1,59 @@
+---
+title: RPC Error Codes
+description: A reference list of standard and Ixian-specific JSON-RPC error codes.
+status: Finalized
+---
+
+## Introduction
+
+Interact with the Ixian API may result in error responses. These errors follow the JSON-RPC 2.0 specification. The `error` field in the JSON response will contain a `code` and a `message`. This document lists the standardized error codes you may encounter.
+
+## Standard JSON-RPC 2.0 Errors
+
+| Code | Message | Description |
+| :--- | :--- | :--- |
+| `-32600` | Invalid Request | The JSON sent is not a valid Request object. |
+| `-32601` | Method Not Found | The method does not exist / is not available. |
+| `-32602` | Invalid Params | Invalid method parameter(s). |
+| `-32603` | Internal Error | Internal JSON-RPC error. |
+| `-32700` | Parse Error | Invalid JSON was received by the server. |
+
+## General Application Errors
+
+| Code | Description |
+| :--- | :--- |
+| `-1` | Miscellaneous error. |
+| `-2` | Forbidden by safe mode. |
+| `-3` | Type error (unexpected parameter type). |
+| `-5` | Invalid address or key. |
+| `-7` | Out of memory. |
+| `-8` | Invalid, missing, or duplicate parameter. |
+| `-20` | Database error. |
+| `-22` | Deserialization error. |
+| `-25` | Verification error (general). |
+| `-26` | Verification rejected (network rules). |
+| `-27` | Transaction already in chain. |
+| `-28` | Client in warmup. |
+
+## P2P Client Errors
+
+| Code | Description |
+| :--- | :--- |
+| `-9` | Client not connected. |
+| `-10` | Client in initial download (synchronizing). |
+| `-23` | Node already added. |
+| `-24` | Node not added. |
+
+## Wallet Errors
+
+| Code | Description |
+| :--- | :--- |
+| `-4` | Unspecified wallet error. |
+| `-6` | Insufficient funds. |
+| `-11` | Invalid account name. |
+| `-12` | Keypool ran out. |
+| `-13` | Wallet unlock needed. |
+| `-14` | Incorrect passphrase. |
+| `-15` | Wrong encryption state. |
+| `-16` | Encryption failed. |
+| `-17` | Wallet already unlocked. |
