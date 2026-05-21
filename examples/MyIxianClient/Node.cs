@@ -1,4 +1,5 @@
 using IXICore;
+using IXICore.Activity;
 using IXICore.Inventory;
 using IXICore.Meta;
 using IXICore.Network;
@@ -23,9 +24,15 @@ namespace IxianClient
 
         private TransactionInclusion? tiv = null;
 
+        private CoreStreamProcessor? streamProcessor = null;
+
         private long lastSectorUpdate = 0;
 
         private NetworkClientManagerStatic? networkClientManagerStatic = null;
+
+        public static IActivityStorage? activityStorage = null;
+
+        private IStorage? blockStorage = null;
 
         public Node()
         {
@@ -40,8 +47,19 @@ namespace IxianClient
             // Initialize wallet
             if (!InitWallet())
             {
-                throw new Exception("Failed to initialize wallet");
+                Console.WriteLine("Failed to initialize wallet. Shutting down.");
+                IxianHandler.requestShutdown();
+                return;
             }
+
+            // Disable console output
+            Logging.consoleOutput = false;
+
+            // Initialize block header storage
+            blockStorage = new RocksDBStorage("headers", 0, CoreConfig.maxBlockHeadersPerDatabase, 3, RocksDBOptimizations.Mobiles, 0);
+
+            // Initialize activity/transaction storage
+            activityStorage = new ActivityStorage("activity", 0, 0, RocksDBOptimizations.Mobiles, 0);
 
             // Initialize peer storage
             PeerStorage.init("");
@@ -49,9 +67,13 @@ namespace IxianClient
             // Setup network client manager (queries blockchain via S2)
             networkClientManagerStatic = new NetworkClientManagerStatic(10);
             NetworkClientManager.init(networkClientManagerStatic);
+            StreamClientManager.init(6, true);
+
+            // Prepare the stream processor
+            streamProcessor = new CoreStreamProcessor(new ICPendingMessageProcessor("", false), StreamCapabilities.Incoming);
 
             // Init TIV
-            tiv = new TransactionInclusion(new ICTransactionInclusionCallbacks(), false);
+            tiv = new TransactionInclusion(blockStorage, new ICTransactionInclusionCallbacks(), TIVBlockVerificationMode.Minimal);
 
             // Initialize presence list with keepalive
             PresenceList.init("", 0, 'C', CoreConfig.clientKeepAliveInterval);
@@ -64,7 +86,6 @@ namespace IxianClient
 
             Console.WriteLine($"Node initialized. Wallet: {IxianHandler.getWalletStorage().getPrimaryAddress()}");
         }
-
 
         private bool InitWallet()
         {
@@ -149,7 +170,7 @@ namespace IxianClient
             List<Address> address_list = IxianHandler.getWalletStorage().getMyAddresses();
             foreach (Address addr in address_list)
             {
-                IxianHandler.balances.Add(new Balance(addr, 0));
+                IxianHandler.balances.Add(addr, new Balance(addr, 0));
             }
 
             return true;
@@ -161,8 +182,41 @@ namespace IxianClient
 
             running = true;
 
+            if (!blockStorage!.prepareStorage(false))
+            {
+                Logging.error("Error while preparing block storage! Aborting.");
+                return;
+            }
+
+            activityStorage!.prepareStorage(false);
+
+            var pending_txs = activityStorage.getActivitiesByStatus(ActivityStatus.Pending, true);
+            pending_txs.AddRange(activityStorage.getActivitiesByStatus(ActivityStatus.Reverted, true));
+            // Load pending transactions
+            foreach (var pending_tx in pending_txs)
+            {
+                if (pending_tx.type == ActivityType.TransactionReceived)
+                {
+                    PendingTransactions.addIncomingTransaction(pending_tx.transaction);
+                }
+                else if (pending_tx.type == ActivityType.TransactionSent
+                        || pending_tx.type == ActivityType.IxiName)
+                {
+                    PendingTransactions.addOutgoingTransaction(pending_tx.transaction, pending_tx.transaction.toList.TakeLast(2).Select(x => x.Key).ToList());
+                }
+            }
+
+            ulong block_height = 0;
+            byte[]? block_checksum = null;
+            if (IxianHandler.networkType == NetworkType.main)
+            {
+                // Use baked block as starting point for mainnet, to avoid having to sync from genesis
+                block_height = CoreConfig.bakedBlockHeight;
+                block_checksum = CoreConfig.bakedBlockChecksum;
+            }
+
             // Start TIV
-            tiv?.start("headers", 0, null, true);
+            tiv?.start(block_height, block_checksum, true);
 
             // Start presence keepalive (announces our presence to network)
             PresenceList.startKeepAlive();
@@ -170,11 +224,13 @@ namespace IxianClient
             // Start the network queue
             NetworkQueue.start();
 
+            streamProcessor.start();
+
             // Connect to your sector of S2 nodes
             NetworkClientManager.start(1);
 
             // Connect to S2 streaming nodes (for presence and messaging)
-            StreamClientManager.start(6, true);
+            StreamClientManager.start();
 
             // Start main loop for periodic tasks
             mainLoopThread = new Thread(MainLoop);
@@ -186,9 +242,21 @@ namespace IxianClient
         public void Stop()
         {
             running = false;
-            mainLoopThread?.Join();
+
+            // First stop localStorage, to flush any pending chat messages to storage
+            // The Node is currently in shutting down state, so no incoming messages will be processed by the message processors
+            IxianHandler.localStorage?.stop();
+
+            // Stop the stream processor, it includes pending messages
+            streamProcessor.stop();
+
+            // Stop everything else storage related
+            activityStorage?.stopStorage();
 
             PeerStorage.savePeersFile(true);
+
+            // Stop the block storage
+            blockStorage?.stopStorage();
 
             tiv?.stop();
             
@@ -196,6 +264,8 @@ namespace IxianClient
             NetworkQueue.stop();
             NetworkClientManager.stop();
             StreamClientManager.stop();
+
+            mainLoopThread?.Join();
 
             Console.WriteLine("Node stopped.");
         }
@@ -214,9 +284,6 @@ namespace IxianClient
 
                     // Check for balance changes
                     CheckBalanceChanges();
-
-                    // Process pending transactions (resend if needed, check status)
-                    processPendingTransactions();
 
                     // Cleanup old presence entries
                     PresenceList.performCleanup();
@@ -244,106 +311,96 @@ namespace IxianClient
 
         private void RequestBalanceUpdate()
         {
-            var balance = IxianHandler.balances.FirstOrDefault();
-            if (balance == null || balance.lastUpdate + 300 < Clock.getTimestamp())
+            foreach (var balance in IxianHandler.balances.Values)
             {
-                var primaryAddress = IxianHandler.getWalletStorage().getPrimaryAddress();
-
-                // Create balance request message
-                byte[] getBalanceBytes;
-                using (var ms = new MemoryStream())
+                // Request initial wallet balance
+                if (balance.blockHeight == 0 || balance.lastUpdate + 300 < Clock.getTimestamp())
                 {
-                    using (var writer = new BinaryWriter(ms))
-                    {
-                        writer.WriteIxiVarInt(primaryAddress.addressNoChecksum.Length);
-                        writer.Write(primaryAddress.addressNoChecksum);
-                    }
-                    getBalanceBytes = ms.ToArray();
+                    CoreProtocolMessage.broadcastProtocolMessage(['M', 'H', 'R'], ProtocolMessageCode.getBalance2, balance.address.addressNoChecksum.GetIxiBytes(), null);
                 }
-
-                // Broadcast balance request to network
-                CoreProtocolMessage.broadcastProtocolMessage(
-                    new char[] { 'M', 'H', 'R' },
-                    ProtocolMessageCode.getBalance2,
-                    getBalanceBytes,
-                    null
-                );
             }
         }
 
         // ===== IxianNode Abstract Method Implementations =====
 
-        public override ulong getHighestKnownNetworkBlockHeight()
+        public override Block? getBlockHeader(ulong blockNum)
         {
-            ulong bh = getLastBlockHeight();
-            ulong netBlockNum = CoreProtocolMessage.determineHighestNetworkBlockNum();
-            if (bh < netBlockNum)
-            {
-                bh = netBlockNum;
-            }
-
-            return bh;
+            return blockStorage!.getBlock(blockNum);
         }
 
-        public override Block getBlockHeader(ulong blockNum)
+        public override byte[]? getBlockHash(ulong blockNum)
         {
-            return BlockHeaderStorage.getBlockHeader(blockNum);
+            var tsd = blockStorage!.getBlockTotalSignerDifficulty(blockNum);
+            return tsd.blockHash;
         }
 
-        public override byte[] getBlockHash(ulong blockNum)
+        public override Block? getLastBlock()
         {
-            var block = getBlockHeader(blockNum);
-            return block?.blockChecksum ?? null;
-        }
-
-        public override Block getLastBlock()
-        {
-            return tiv?.getLastBlockHeader() ?? null;
+            return tiv.getLastBlockHeader();
         }
 
         public override ulong getLastBlockHeight()
         {
-            if (tiv?.getLastBlockHeader() == null)
+            Block? block = tiv.getLastBlockHeader();
+            if (block == null)
             {
                 return 0;
             }
-            return tiv.getLastBlockHeader().blockNum;
+            return block.blockNum;
         }
 
         public override int getLastBlockVersion()
         {
-            return Block.maxVersion;
+            Block? block = tiv.getLastBlockHeader();
+            if (block == null
+                || block.version < Block.maxVersion)
+            {
+                // TODO Omega force to v10 after upgrade
+                return Block.maxVersion - 1;
+            }
+            return block.version;
         }
 
-        public override bool addTransaction(Transaction tx, List<Address> relayNodeAddresses, bool force_broadcast)
+        public override bool addIncomingTransaction(Transaction tx)
         {
-            foreach (var address in relayNodeAddresses)
+            if (tx.timeStamp == 0)
             {
-                NetworkClientManager.sendToClient(address, ProtocolMessageCode.transactionData2, tx.getBytes(true, true), null);
+                tx.timeStamp = Clock.getTimestamp();
             }
-            PendingTransactions.addPendingLocalTransaction(tx, relayNodeAddresses);
-            return true;
+            if (IxianHandler.addTransactionToActivityStorage(activityStorage, tx))
+            {
+                return PendingTransactions.addIncomingTransaction(tx);
+            }
+            return false;
+        }
+
+        public override bool addTransaction(Transaction tx, List<Address> relayNodeAddresses, List<ExtendedAddress>? extendedAddresses, byte[]? requestId, bool force_broadcast)
+        {
+            if (tx.timeStamp == 0)
+            {
+                tx.timeStamp = Clock.getTimestamp();
+            }
+            if (IxianHandler.addTransactionToActivityStorage(activityStorage, tx))
+            {
+                if (PendingTransactions.addOutgoingTransaction(tx, relayNodeAddresses))
+                {
+                    foreach (var address in relayNodeAddresses)
+                    {
+                        NetworkClientManager.sendToClient(address, ProtocolMessageCode.transactionData2, tx.getBytes(true, true));
+                    }
+                    if (extendedAddresses != null)
+                    {
+                        CoreStreamProcessor.transactionSend(tx, extendedAddresses, requestId);
+                    }
+                    return true;
+                }
+            }
+            return false;
         }
 
         public override bool isAcceptingConnections()
         {
             return false; // Clients don't accept incoming connections
-        }
-
-        public override Wallet getWallet(Address id)
-        {
-            foreach (Balance balance in IxianHandler.balances)
-            {
-                if (id.addressNoChecksum.SequenceEqual(balance.address.addressNoChecksum))
-                    return new Wallet(id, balance.balance);
-            }
-            return new Wallet(id, 0);
-        }
-
-        public override IxiNumber getWalletBalance(Address id)
-        {
-            var balance = IxianHandler.balances.FirstOrDefault(b => b.address.SequenceEqual(id));
-            return balance?.balance ?? new IxiNumber(0);
         }
 
         public override void parseProtocolMessage(ProtocolMessageCode code, byte[] data, RemoteEndpoint endpoint)
@@ -366,7 +423,7 @@ namespace IxianClient
                                 {
                                     CoreProtocolMessage.processHelloMessageV6(endpoint, reader);
 
-                                    Friend friend = FriendList.getFriend(endpoint.presence.wallet);
+                                    Friend? friend = FriendList.getFriend(endpoint.presence.wallet);
                                     if (friend != null)
                                     {
                                         friend.updatedStreamingNodes = Clock.getNetworkTimestamp();
@@ -375,7 +432,6 @@ namespace IxianClient
                                     }
                                 }
                             }
-
                         }
                         break;
 
@@ -416,17 +472,16 @@ namespace IxianClient
 
                                 if (node_type == 'R')
                                 {
-                                    string[] connected_servers = StreamClientManager.getConnectedClients(true);
-                                    if (connected_servers.Count() > 0
-                                        && !connected_servers.Contains(StreamClientManager.primaryS2Address))
+                                    if (!StreamClientManager.isConnectedTo(StreamClientManager.primaryS2Address)
+                                        && StreamClientManager.isConnectedTo(endpoint))
                                     {
                                         // Update local presence information
                                         StreamClientManager.primaryS2Address = endpoint.getFullAddress(true);
                                         IxianHandler.publicPort = endpoint.incomingPort;
                                         IxianHandler.publicIP = endpoint.address;
+                                        StreamClientManager.setPinnedNodes(new() { StreamClientManager.primaryS2Address });
                                         PresenceList.forceSendKeepAlive = true;
                                         Logging.info("Forcing KA from networkprotocol");
-                                        RequestSectorUpdate();
                                     }
                                     else
                                     {
@@ -436,8 +491,7 @@ namespace IxianClient
                                         {
                                             foreach (var pa in myPresence.addresses)
                                             {
-                                                byte[] hash = CryptoManager.lib.sha3_512sqTrunc(pa.getBytes());
-                                                var iika = new InventoryItemKeepAlive(hash, pa.lastSeenTime, myPresence.wallet, pa.device);
+                                                var iika = new InventoryItemKeepAlive2(pa.lastSeenTime, myPresence.wallet, pa.device);
                                                 endpoint.addInventoryItem(iika);
                                             }
                                         }
@@ -454,10 +508,10 @@ namespace IxianClient
                                     || node_type == 'H'
                                     || node_type == 'R')
                                 {
-                                    SubscribeToEvents(endpoint);
+                                    CoreProtocolMessage.subscribeToEvents(endpoint);
                                 }
 
-                                Friend friend = FriendList.getFriend(endpoint.presence.wallet);
+                                Friend? friend = FriendList.getFriend(endpoint.presence.wallet);
                                 if (friend != null)
                                 {
                                     friend.updatedStreamingNodes = Clock.getNetworkTimestamp();
@@ -477,6 +531,7 @@ namespace IxianClient
 
                     case ProtocolMessageCode.s2data:
                         {
+                            streamProcessor.receiveData(data, endpoint);
                         }
                         break;
 
@@ -489,7 +544,7 @@ namespace IxianClient
                                     int walletLen = (int)reader.ReadIxiVarUInt();
                                     Address wallet = new Address(reader.ReadBytes(walletLen));
 
-                                    Presence p = PresenceList.getPresenceByAddress(wallet);
+                                    Presence? p = PresenceList.getPresenceByAddress(wallet);
                                     if (p != null)
                                     {
                                         lock (p)
@@ -497,7 +552,7 @@ namespace IxianClient
                                             byte[][] presence_chunks = p.getByteChunks();
                                             foreach (byte[] presence_chunk in presence_chunks)
                                             {
-                                                endpoint.sendData(ProtocolMessageCode.updatePresence, presence_chunk, null);
+                                                endpoint.sendData(ProtocolMessageCode.updatePresence, presence_chunk);
                                             }
                                         }
                                     }
@@ -512,6 +567,13 @@ namespace IxianClient
 
                     case ProtocolMessageCode.balance2:
                         {
+                            if (endpoint.presenceAddress.type != 'M'
+                                && endpoint.presenceAddress.type != 'H'
+                                && endpoint.presenceAddress.type != 'R')
+                            {
+                                Logging.warn("Received balance2 from non-master node {0}. Ignoring.", endpoint.getFullAddress());
+                                return;
+                            }
                             using (MemoryStream m = new MemoryStream(data))
                             {
                                 using (BinaryReader reader = new BinaryReader(m))
@@ -529,7 +591,7 @@ namespace IxianClient
                                     ulong block_height = reader.ReadIxiVarUInt();
                                     byte[] block_checksum = reader.ReadBytes((int)reader.ReadIxiVarUInt());
 
-                                    foreach (Balance balance in IxianHandler.balances)
+                                    foreach (Balance balance in IxianHandler.balances.Values)
                                     {
                                         if (address.addressNoChecksum.SequenceEqual(balance.address.addressNoChecksum))
                                         {
@@ -550,7 +612,6 @@ namespace IxianClient
                         }
                         break;
 
-
                     case ProtocolMessageCode.updatePresence:
                         HandleUpdatePresence(data, endpoint);
                         break;
@@ -560,35 +621,18 @@ namespace IxianClient
                         break;
 
                     case ProtocolMessageCode.blockHeaders4:
-                        {
-                            using (MemoryStream m = new MemoryStream(data))
-                            {
-                                using (BinaryReader reader = new BinaryReader(m))
-                                {
-                                    ulong from = reader.ReadIxiVarUInt();
-                                    ulong totalCount = reader.ReadIxiVarUInt();
-
-                                    int filterLen = (int)reader.ReadIxiVarUInt();
-                                    byte[] filterBytes = reader.ReadBytes(filterLen);
-
-                                    byte[] headersBytes = new byte[reader.BaseStream.Length - reader.BaseStream.Position];
-                                    Array.Copy(data, reader.BaseStream.Position, headersBytes, 0, headersBytes.Length);
-
-                                    tiv?.receivedBlockHeaders3(headersBytes, endpoint);
-                                }
-                            }
-                        }
-                        break;
-
-                    case ProtocolMessageCode.blockHeaders3:
-                        {
-                            // Forward the block headers to the TIV handler
-                            tiv?.receivedBlockHeaders3(data, endpoint);
-                        }
+                        HandleBlockHeaders4(data, endpoint);
                         break;
 
                     case ProtocolMessageCode.pitData2:
                         {
+                            if (endpoint.presenceAddress.type != 'M'
+                                && endpoint.presenceAddress.type != 'H'
+                                && endpoint.presenceAddress.type != 'R')
+                            {
+                                Logging.warn("Received pit data from non-master node {0}. Ignoring.", endpoint.getFullAddress());
+                                return;
+                            }
                             tiv?.receivedPIT2(data, endpoint);
                         }
                         break;
@@ -620,10 +664,13 @@ namespace IxianClient
                         HandleRejected(data, endpoint);
                         break;
 
+                    case ProtocolMessageCode.transactionsChunk3:
+                        HandleTransactionsChunk3(data, endpoint);
+                        break;
+
                     default:
                         Logging.warn("Unknown protocol message: {0}, from {1} ({2})", code, endpoint.getFullAddress(), endpoint.serverWalletAddress);
                         break;
-
                 }
             }
             catch (Exception e)
@@ -639,7 +686,7 @@ namespace IxianClient
 
         public override IxiNumber getMinSignerPowDifficulty(ulong blockNum, int curBlockVersion, long curBlockTimestamp)
         {
-            return ConsensusConfig.minBlockSignerPowDifficulty;
+            return tiv.getMinSignerPowDifficulty(blockNum, curBlockVersion, curBlockTimestamp);
         }
 
         public override RegisteredNameRecord getRegName(byte[] name, bool useAbsoluteId)
@@ -647,66 +694,86 @@ namespace IxianClient
             throw new NotImplementedException();
         }
 
-        public (Transaction transaction, List<Address> relayNodeAddresses) prepareTransactionFrom(Address fromAddress, Address toAddress, IxiNumber amount)
+        private (Transaction? transaction, List<Address>? relayNodeAddresses, List<ExtendedAddress>? extendedAddresses) PrepareTransactionFrom(Address fromAddress, ExtendedAddress toAddress, IxiNumber amount, bool check_balance = true)
         {
             IxiNumber fee = ConsensusConfig.forceTransactionPrice;
-            Dictionary<Address, ToEntry> to_list = new(new AddressComparer());
+            Dictionary<Address, ToEntry> toList = new(new AddressComparer());
             Address pubKey = new(IxianHandler.getWalletStorage().getPrimaryPublicKey());
 
             if (!IxianHandler.getWalletStorage().isMyAddress(fromAddress))
             {
-                Logging.info("From address is not my address.");
-                return (null, null);
+                Console.WriteLine("From address is not my address.");
+                return (null, null, null);
             }
 
-            Dictionary<byte[], IxiNumber> from_list = new(new ByteArrayComparer())
+            Dictionary<byte[], IxiNumber> fromList = new(new ByteArrayComparer())
             {
                 { IxianHandler.getWalletStorage().getAddress(fromAddress).nonce, amount }
             };
 
-            to_list.AddOrReplace(toAddress, new ToEntry(Transaction.maxVersion, amount));
+            List<ExtendedAddress> extendedAddresses = new List<ExtendedAddress>();
 
-            List<Address> relayNodeAddresses = NetworkClientManager.getRandomConnectedClientAddresses(2);
-            IxiNumber relayFee = 0;
-            foreach (Address relayNodeAddress in relayNodeAddresses)
+            toList.AddOrReplace(toAddress.PaymentAddress, new ToEntry(Transaction.getExpectedVersion(IxianHandler.getLastBlockVersion()), amount, toAddress.Tag));
+
+            if (toAddress.Flag != AddressPaymentFlag.Primary)
             {
+                extendedAddresses.Add(toAddress);
+            }
+
+            List<Address> tmpRelayNodeAddresses = NetworkClientManager.getRandomConnectedClientAddresses(2);
+            List<Address> relayNodeAddresses = new List<Address>();
+            IxiNumber relayFee = 0;
+            foreach (Address relayNodeAddress in tmpRelayNodeAddresses)
+            {
+                if (toList.ContainsKey(relayNodeAddress))
+                {
+                    continue;
+                }
                 var tmpFee = fee > ConsensusConfig.transactionDustLimit ? fee : ConsensusConfig.transactionDustLimit;
-                to_list.AddOrReplace(relayNodeAddress, new ToEntry(Transaction.maxVersion, tmpFee));
+                ToEntry toEntry = new ToEntry(getExpectedVersion(IxianHandler.getLastBlockVersion()),
+                                              tmpFee,
+                                              null,
+                                              null);
+                relayNodeAddresses.Add(relayNodeAddress);
+                toList.Add(relayNodeAddress, toEntry);
                 relayFee += tmpFee;
             }
 
             // Prepare transaction to calculate fee
-            Transaction transaction = new((int)Transaction.Type.Normal, fee, to_list, from_list, pubKey, IxianHandler.getHighestKnownNetworkBlockHeight());
+            Transaction transaction = new((int)Transaction.Type.Normal, fee, toList, fromList, pubKey, IxianHandler.getHighestKnownNetworkBlockHeight());
 
             relayFee = 0;
             foreach (Address relayNodeAddress in relayNodeAddresses)
             {
                 var tmpFee = transaction.fee > ConsensusConfig.transactionDustLimit ? transaction.fee : ConsensusConfig.transactionDustLimit;
-                to_list[relayNodeAddress].amount = tmpFee;
+                toList[relayNodeAddress].amount = tmpFee;
                 relayFee += tmpFee;
             }
 
-            byte[] first_address = from_list.Keys.First();
-            from_list[first_address] = from_list[first_address] + relayFee + transaction.fee;
-            IxiNumber wal_bal = IxianHandler.getWalletBalance(new Address(transaction.pubKey.addressNoChecksum, first_address));
-            if (from_list[first_address] > wal_bal)
+            byte[] first_address = fromList.Keys.First();
+            fromList[first_address] = fromList[first_address] + relayFee + transaction.fee;
+            if (check_balance)
             {
-                IxiNumber maxAmount = wal_bal - transaction.fee;
+                IxiNumber wal_bal = IxianHandler.getWalletBalance(new Address(transaction.pubKey.addressNoChecksum, first_address));
+                if (fromList[first_address] > wal_bal)
+                {
+                    IxiNumber maxAmount = wal_bal - transaction.fee;
 
-                if (maxAmount < 0)
-                    maxAmount = 0;
+                    if (maxAmount < 0)
+                        maxAmount = 0;
 
-                Console.WriteLine($"Insufficient funds to cover amount and transaction fee.\nMaximum amount you can send is {maxAmount} IXI.\n");
-                return (null, null);
+                    Console.WriteLine($"Insufficient funds to cover amount and transaction fee.\nMaximum amount you can send is {maxAmount} IXI.\n");
+                    return (null, null, null);
+                }
             }
             // Prepare transaction with updated "from" amount to cover fee
-            transaction = new((int)Transaction.Type.Normal, fee, to_list, from_list, pubKey, IxianHandler.getHighestKnownNetworkBlockHeight());
-            return (transaction, relayNodeAddresses);
+            transaction = new((int)Transaction.Type.Normal, fee, toList, fromList, pubKey, IxianHandler.getHighestKnownNetworkBlockHeight());
+            return (transaction, relayNodeAddresses, extendedAddresses);
         }
 
-        public Transaction sendTransactionFrom(Address fromAddress, Address toAddress, IxiNumber amount)
+        public Transaction? SendTransactionFrom(Address fromAddress, ExtendedAddress toAddress, IxiNumber amount, byte[]? requestId)
         {
-            var prepTx = prepareTransactionFrom(fromAddress, toAddress, amount);
+            var prepTx = PrepareTransactionFrom(fromAddress, toAddress, amount);
             var transaction = prepTx.transaction;
             var relayNodeAddresses = prepTx.relayNodeAddresses;
             
@@ -714,9 +781,9 @@ namespace IxianClient
             {
                 return null;
             }
-            
+
             // Send the transaction
-            if (IxianHandler.addTransaction(transaction, relayNodeAddresses, true))
+            if (IxianHandler.addTransaction(transaction, relayNodeAddresses, prepTx.extendedAddresses, requestId, true))
             {
                 Console.WriteLine($"Sending transaction, txid: {transaction.getTxIdString()}");
                 return transaction;
@@ -732,11 +799,11 @@ namespace IxianClient
         {
             try
             {
-                var recipient = new Address(toAddress);
+                var recipient = new ExtendedAddress(toAddress);
                 var txAmount = new IxiNumber(amount);
                 var myAddress = IxianHandler.getWalletStorage().getPrimaryAddress();
 
-                var tx = sendTransactionFrom(myAddress, recipient, txAmount);
+                var tx = SendTransactionFrom(myAddress, recipient, txAmount, null);
                 return tx != null;
             }
             catch (Exception e)
@@ -795,6 +862,7 @@ namespace IxianClient
                 null
             );
         }
+
         // Check if an address is online (from local cache)
         public bool IsAddressOnline(string address)
         {
@@ -832,7 +900,7 @@ namespace IxianClient
             Console.WriteLine($"Requesting presence for {address}...");
 
             // Create a temporary friend object to use the sector-based presence fetching mechanism
-            var friend = new Friend(FriendState.Approved, addr, null, "", null, null, 0, true);
+            var friend = new Friend(FriendType.Temporary, FriendState.Approved, addr, null, "", null, null, 0, true);
             
             // Get relay nodes responsible for this address's sector from local cache
             List<Peer> peers = new();
@@ -893,27 +961,29 @@ namespace IxianClient
         public string GetTransactionStatus(byte[] txid)
         {
             // Check if transaction is confirmed
-            Transaction confirmedTx = TransactionCache.getTransaction(txid);
-            if (confirmedTx != null && confirmedTx.applied != 0)
+            ActivityObject? activity = activityStorage.getActivityById(txid);
+            if (activity == null)
             {
-                return $"Confirmed in block {confirmedTx.applied}";
+                return "Unknown (not found)";
             }
 
-            // Check if transaction is pending
-            Transaction unconfirmedTx = TransactionCache.getUnconfirmedTransaction(txid);
-            if (unconfirmedTx != null)
+            switch (activity.status)
             {
-                return "Pending (waiting for confirmation)";
+                case ActivityStatus.Final:
+                    return $"Confirmed in block {activity.appliedBlockHeight}";
+                case ActivityStatus.Pending:
+                    return "Pending (waiting for confirmation)";
+                case ActivityStatus.Reverted:
+                    return "Reverted (transaction was included in a block that got reverted)";
+                case ActivityStatus.Rejected:
+                    return "Rejected (transaction was rejected by the network)";
+                case ActivityStatus.Expired:
+                    return "Expired (transaction was not included in a block within the expected time frame)";
+                case ActivityStatus.Unknown:
+                    return "Unknown (transaction status cannot be verified)";
             }
 
-            // Check pending transactions list
-            var pendingTx = PendingTransactions.getPendingTransaction(txid);
-            if (pendingTx != null)
-            {
-                return $"Sent (confirmed by {pendingTx.confirmedNodeList.Count} nodes)";
-            }
-
-            return "Unknown (not found)";
+            return "Unknown status";
         }
 
         // Get transaction status by string txid
@@ -930,91 +1000,141 @@ namespace IxianClient
             }
         }
 
-        private void SubscribeToEvents(RemoteEndpoint endpoint)
+        private void HandleTransactionsChunk3(byte[] data, RemoteEndpoint endpoint)
         {
-            CoreProtocolMessage.subscribeToEvents(endpoint);
-
-            // Subscribe to friend presences if outgoing stream capabilities are enabled
-            if ((CoreStreamProcessor.streamCapabilities & StreamCapabilities.Outgoing) != 0)
+            if (endpoint.presenceAddress.type != 'M'
+                        && endpoint.presenceAddress.type != 'H'
+                        && endpoint.presenceAddress.type != 'R')
             {
-                byte[] friend_matcher = FriendList.getFriendCuckooFilter();
-                if (friend_matcher != null)
+                Console.WriteLine($"Received transactions chunk from non-master node {endpoint.getFullAddress()}. Ignoring.");
+                return;
+            }
+            using (MemoryStream m = new MemoryStream(data))
+            {
+                using (BinaryReader reader = new BinaryReader(m))
                 {
-                    byte[] event_data = NetworkEvents.prepareEventMessageData(NetworkEvents.Type.keepAlive, friend_matcher);
-                    endpoint.sendData(ProtocolMessageCode.attachEvent, event_data);
+                    long msg_id = reader.ReadIxiVarInt();
+
+                    int tx_count = (int)reader.ReadIxiVarUInt();
+
+                    int max_tx_per_chunk = CoreConfig.maximumTransactionsPerChunk;
+                    if (tx_count > max_tx_per_chunk)
+                    {
+                        tx_count = max_tx_per_chunk;
+                    }
+
+                    var sw = new System.Diagnostics.Stopwatch();
+                    sw.Start();
+                    int processedTxCount = 0;
+                    int totalTxCount = 0;
+                    for (int i = 0; i < tx_count; i++)
+                    {
+                        if (m.Position == m.Length)
+                        {
+                            break;
+                        }
+
+                        int tx_len = (int)reader.ReadIxiVarUInt();
+                        byte[] tx_bytes = reader.ReadBytes(tx_len);
+
+                        Transaction tx = new Transaction(tx_bytes, false, true);
+
+                        totalTxCount++;
+
+                        if (IxianHandler.addIncomingTransaction(tx))
+                        {
+                            processedTxCount++;
+                        }
+                    }
+                    sw.Stop();
+                    TimeSpan elapsed = sw.Elapsed;
+                    Logging.info("Processed {0}/{1} txs for #{2} in {3}ms", processedTxCount, totalTxCount, msg_id, elapsed.TotalMilliseconds);
+                }
+            }
+        }
+
+        private void HandleBlockHeaders4(byte[] data, RemoteEndpoint endpoint)
+        {
+            if (endpoint.presenceAddress.type != 'M'
+                && endpoint.presenceAddress.type != 'H'
+                && endpoint.presenceAddress.type != 'R')
+            {
+                Logging.warn("Received block headers from non-master node {0}. Ignoring.", endpoint.getFullAddress());
+                return;
+            }
+            using (MemoryStream m = new MemoryStream(data))
+            {
+                using (BinaryReader reader = new BinaryReader(m))
+                {
+                    ulong from = reader.ReadIxiVarUInt();
+                    if (from > IxianHandler.getLastBlockHeight() + 1)
+                    {
+                        Logging.warn("Received block headers starting from {0}, but our last block height is {1}. Ignoring.", from, IxianHandler.getLastBlockHeight());
+                        return;
+                    }
+                    ulong totalCount = reader.ReadIxiVarUInt();
+
+                    int filterLen = (int)reader.ReadIxiVarUInt();
+                    byte[] filterBytes = reader.ReadBytes(filterLen);
+
+                    byte[] headersBytes = new byte[reader.BaseStream.Length - reader.BaseStream.Position];
+                    Array.Copy(data, reader.BaseStream.Position, headersBytes, 0, headersBytes.Length);
+
+                    tiv.receivedBlockHeaders3(headersBytes, endpoint);
                 }
             }
         }
 
         private void HandleTransactionData(byte[] data, RemoteEndpoint endpoint)
         {
+            if (endpoint.presenceAddress.type != 'M'
+                && endpoint.presenceAddress.type != 'H'
+                && endpoint.presenceAddress.type != 'R')
+            {
+                Logging.warn("Received transaction data from non-master node {0}. Ignoring.", endpoint.getFullAddress());
+                return;
+            }
+
             Transaction tx = new Transaction(data, true, true);
 
-            if (endpoint.presenceAddress.type == 'M'
-                || endpoint.presenceAddress.type == 'H'
-                || endpoint.presenceAddress.type == 'R')
+            // Check if my transaction
+            bool myTransaction = IxianHandler.isMyAddress(tx.pubKey);
+            if (!myTransaction)
             {
-                PendingTransactions.increaseReceivedCount(tx.id, endpoint.presence.wallet);
-            }
-
-            TransactionCache.addUnconfirmedTransaction(tx);
-
-            tiv?.receivedNewTransaction(tx);
-        }
-
-
-        private void HandleSectorNodes(byte[] data, RemoteEndpoint endpoint)
-        {
-            int offset = 0;
-
-            var prefixAndOffset = data.ReadIxiBytes(offset);
-            offset += prefixAndOffset.bytesRead;
-            byte[] prefix = prefixAndOffset.bytes;
-
-            var nodeCountAndOffset = data.GetIxiVarUInt(offset);
-            offset += nodeCountAndOffset.bytesRead;
-            int nodeCount = (int)nodeCountAndOffset.num;
-
-            for (int i = 0; i < nodeCount; i++)
-            {
-                var kaBytesAndOffset = data.ReadIxiBytes(offset);
-                offset += kaBytesAndOffset.bytesRead;
-
-                Presence p = PresenceList.updateFromBytes(kaBytesAndOffset.bytes, IxianHandler.getMinSignerPowDifficulty(IxianHandler.getLastBlockHeight() + 1, IxianHandler.getLastBlockVersion(), Clock.getNetworkTimestamp()));
-                if (p != null)
+                foreach (var toEntry in tx.toList.Keys)
                 {
-                    RelaySectors.Instance.addRelayNode(p.wallet);
+                    if (IxianHandler.isMyAddress(toEntry))
+                    {
+                        myTransaction = true;
+                        break;
+                    }
                 }
             }
 
-            List<Peer> peers = new();
-            var relays = RelaySectors.Instance.getSectorNodes(prefix, CoreConfig.maxRelaySectorNodesToRequest);
-            foreach (var relay in relays)
+            Logging.trace("Received new transaction {0}", tx.getTxIdString());
+
+            if (myTransaction)
             {
-                var p = PresenceList.getPresenceByAddress(relay);
-                if (p == null)
+                // If transaction already processed
+                ActivityObject? activity = activityStorage.getActivityById(tx.id, null);
+                if (activity != null)
                 {
-                    continue;
+                    if (activity.status != ActivityStatus.Final)
+                    {
+                        if (endpoint.presenceAddress.type == 'M'
+                            || endpoint.presenceAddress.type == 'H'
+                            || endpoint.presenceAddress.type == 'R')
+                        {
+                            PendingTransactions.increaseReceivedCount(tx.id, endpoint.presence.wallet);
+                        }
+                    }
                 }
-                var pa = p.addresses.First();
-                peers.Add(new(pa.address, relay, pa.lastSeenTime, 0, 0, 0));
-
-                PeerStorage.addPeerToPeerList(pa.address, p.wallet, pa.lastSeenTime, 0, 0, 0);
-            }
-
-            if (IxianHandler.primaryWalletAddress.sectorPrefix.SequenceEqual(prefix))
-            {
-                networkClientManagerStatic.setClientsToConnectTo(peers);
-            }
-
-            var friends = FriendList.getFriendsBySectorPrefix(prefix);
-            foreach (var friend in friends)
-            {
-                friend.updatedSectorNodes = Clock.getNetworkTimestamp();
-                friend.sectorNodes = peers;
+                else
+                {
+                    IxianHandler.addIncomingTransaction(tx);
+                }
             }
         }
-
 
         private void HandleKeepAlivesChunk(byte[] data, RemoteEndpoint endpoint)
         {
@@ -1046,6 +1166,136 @@ namespace IxianClient
             }
         }
 
+        private void HandleUpdatePresence(byte[] data, RemoteEndpoint endpoint)
+        {
+            // Parse the data and update entries in the presence list
+            Presence? p = PresenceList.updateFromBytes(data, IxianHandler.getMinSignerPowDifficulty(IxianHandler.getLastBlockHeight(), IxianHandler.getLastBlockVersion(), 0));
+            if (p == null)
+            {
+                return;
+            }
+
+            Logging.trace("Received presence update for " + p.wallet);
+            Friend? f = FriendList.getFriend(p.wallet);
+            if (f != null)
+            {
+                if (f.publicKey == null)
+                {
+                    f.setPublicKey(p.pubkey);
+                }
+                var pa = p.addresses[0];
+                if (f.lastSeenTime < pa.lastSeenTime)
+                {
+                    // TODO use actual wallet address once Presence hostname contains such address
+                    f.relayNode = new Peer(pa.address, null, pa.lastSeenTime, 0, 0, 0);
+                    f.updatedStreamingNodes = pa.lastSeenTime;
+                    f.lastSeenTime = pa.lastSeenTime;
+                }
+            }
+        }
+
+        private void HandleKeepAlivePresence(byte[] data, RemoteEndpoint endpoint)
+        {
+            Address address;
+            long last_seen = 0;
+            byte[] device_id;
+            char node_type;
+            bool updated = PresenceList.receiveKeepAlive(data, out address, out last_seen, out device_id, out node_type, endpoint);
+
+            InventoryCache.Instance.setProcessedFlag(InventoryItemTypes.keepAlive2, InventoryItemKeepAlive2.getHash(last_seen, address, device_id));
+
+            if (!updated)
+            {
+                return;
+            }
+
+            Logging.trace("Received keepalive update for " + address);
+            Presence? p = PresenceList.getPresenceByAddress(address);
+            if (p == null)
+                return;
+
+            Friend? f = FriendList.getFriend(p.wallet);
+            if (f != null)
+            {
+                var pa = p.addresses[0];
+                if (f.lastSeenTime < pa.lastSeenTime)
+                {
+                    // TODO use actual wallet address once Presence hostname contains such address
+                    f.relayNode = new Peer(pa.address, null, pa.lastSeenTime, 0, 0, 0);
+                    f.updatedStreamingNodes = pa.lastSeenTime;
+                    f.lastSeenTime = pa.lastSeenTime;
+                }
+            }
+        }
+
+        private void HandleSectorNodes(byte[] data, RemoteEndpoint endpoint)
+        {
+            if (endpoint.presenceAddress.type != 'M'
+                && endpoint.presenceAddress.type != 'H'
+                && endpoint.presenceAddress.type != 'R')
+            {
+                Logging.warn("Received sector nodes from non-master node {0}. Ignoring.", endpoint.getFullAddress());
+                return;
+            }
+
+            int offset = 0;
+
+            var prefixAndOffset = data.ReadIxiBytes(offset);
+            offset += prefixAndOffset.bytesRead;
+            byte[] prefix = prefixAndOffset.bytes;
+
+            var nodeCountAndOffset = data.GetIxiVarUInt(offset);
+            offset += nodeCountAndOffset.bytesRead;
+            int nodeCount = (int)nodeCountAndOffset.num;
+
+            for (int i = 0; i < nodeCount; i++)
+            {
+                var kaBytesAndOffset = data.ReadIxiBytes(offset);
+                offset += kaBytesAndOffset.bytesRead;
+
+                Presence? p = PresenceList.updateFromBytes(kaBytesAndOffset.bytes, IxianHandler.getMinSignerPowDifficulty(IxianHandler.getLastBlockHeight(), IxianHandler.getLastBlockVersion(), 0));
+                if (p != null)
+                {
+                    RelaySectors.Instance.addRelayNode(p.wallet);
+                }
+            }
+
+            List<Peer> peers = new();
+            var relays = RelaySectors.Instance.getSectorNodes(prefix, CoreConfig.maxRelaySectorNodesToRequest);
+            foreach (var relay in relays)
+            {
+                var p = PresenceList.getPresenceByAddress(relay);
+                if (p == null)
+                {
+                    continue;
+                }
+                var pa = p.addresses.First();
+                peers.Add(new(pa.address, relay, pa.lastSeenTime, 0, 0, 0));
+
+                PeerStorage.addPeerToPeerList(pa.address, p.wallet, pa.lastSeenTime, 0, 0, 0);
+            }
+
+            if (IxianHandler.primaryWalletAddress.sectorPrefix.SequenceEqual(prefix))
+            {
+                networkClientManagerStatic.setClientsToConnectTo(peers);
+            }
+
+            var friends = FriendList.getFriendsBySectorPrefix(prefix);
+            foreach (var friend in friends)
+            {
+                friend.updatedSectorNodes = Clock.getTimestamp();
+                friend.sectorNodes = peers;
+            }
+
+            friends = IXISocketConnections.GetPendingSectorRequestsBySectorPrefix(prefix);
+            foreach (var friend in friends)
+            {
+                friend.updatedSectorNodes = Clock.getTimestamp();
+                friend.sectorNodes = peers;
+                IXISocketConnections.RemovePendingSectorRequest(friend);
+            }
+        }
+
         private void HandleRejected(byte[] data, RemoteEndpoint endpoint)
         {
             try
@@ -1056,13 +1306,26 @@ namespace IxianClient
                     case RejectedCode.TransactionInvalid:
                     case RejectedCode.TransactionInsufficientFee:
                     case RejectedCode.TransactionDust:
-                        Logging.error("Transaction {0} was rejected with code: {1}", Crypto.hashToString(rej.data), rej.code);
-                        PendingTransactions.remove(rej.data);
-                        // TODO flag transaction as invalid
+                        if (endpoint.presenceAddress.type != 'M'
+                            && endpoint.presenceAddress.type != 'H'
+                            && endpoint.presenceAddress.type != 'R')
+                        {
+                            Logging.error("Received 'rejected' message {0} {1} from non-master {2}", rej.code, Transaction.getTxIdString(rej.data), endpoint.getFullAddress());
+                            return;
+                        }
+                        Logging.error("Transaction {0} was rejected with code: {1}", Transaction.getTxIdString(rej.data), rej.code);
+                        PendingTransactions.increaseRejectedCount(rej.data, endpoint.serverWalletAddress);
                         break;
 
                     case RejectedCode.TransactionDuplicate:
-                        Logging.warn("Transaction {0} already sent.", Crypto.hashToString(rej.data), rej.code);
+                        if (endpoint.presenceAddress.type != 'M'
+                            && endpoint.presenceAddress.type != 'H'
+                            && endpoint.presenceAddress.type != 'R')
+                        {
+                            Logging.error("Received 'rejected' message {0} {1} from non-master {2}", rej.code, Transaction.getTxIdString(rej.data), endpoint.getFullAddress());
+                            return;
+                        }
+                        Logging.warn("Transaction {0} already sent.", Transaction.getTxIdString(rej.data), rej.code);
                         // All good
                         PendingTransactions.increaseReceivedCount(rej.data, endpoint.serverWalletAddress);
                         break;
@@ -1075,116 +1338,6 @@ namespace IxianClient
             catch (Exception e)
             {
                 throw new Exception(string.Format("Exception occured while processing 'rejected' message with code {0} {1}", data[0], Crypto.hashToString(data)), e);
-            }
-        }
-
-        private void HandleUpdatePresence(byte[] data, RemoteEndpoint endpoint)
-        {
-
-            // Parse the data and update entries in the presence list
-            Presence p = PresenceList.updateFromBytes(data, 0);
-            if (p == null)
-            {
-                return;
-            }
-
-            Logging.info("Received presence update for " + p.wallet);
-            Friend f = FriendList.getFriend(p.wallet);
-            if (f != null)
-            {
-                var pa = p.addresses[0];
-                f.relayNode = new Peer(pa.address, null, pa.lastSeenTime, 0, 0, 0);
-                f.updatedStreamingNodes = pa.lastSeenTime;
-            }
-        }
-
-        private void HandleKeepAlivePresence(byte[] data, RemoteEndpoint endpoint)
-        {
-            byte[] hash = CryptoManager.lib.sha3_512sqTrunc(data);
-
-            InventoryCache.Instance.setProcessedFlag(InventoryItemTypes.keepAlive, hash);
-
-            Address address;
-            long last_seen;
-            byte[] device_id;
-            char node_type;
-            bool updated = PresenceList.receiveKeepAlive(data, out address, out last_seen, out device_id, out node_type, endpoint);
-
-            Logging.trace("Received keepalive update for " + address);
-            Presence p = PresenceList.getPresenceByAddress(address);
-            if (p == null)
-                return;
-
-            Friend f = FriendList.getFriend(p.wallet);
-            if (f != null)
-            {
-                var pa = p.addresses[0];
-                f.relayNode = new Peer(pa.address, null, pa.lastSeenTime, 0, 0, 0);
-                f.updatedStreamingNodes = pa.lastSeenTime;
-            }
-        }
-
-        public static void processPendingTransactions()
-        {
-            ulong last_block_height = IxianHandler.getLastBlockHeight();
-            lock (PendingTransactions.pendingTransactions)
-            {
-                long cur_time = Clock.getTimestamp();
-                List<PendingTransaction> tmp_pending_transactions = new(PendingTransactions.pendingTransactions);
-                foreach (var entry in tmp_pending_transactions)
-                {
-                    long tx_time = entry.addedTimestamp;
-
-                    if (entry.transaction.blockHeight > last_block_height)
-                    {
-                        // not ready yet, syncing to the network
-                        continue;
-                    }
-
-                    Transaction t = TransactionCache.getTransaction(entry.transaction.id);
-                    if (t == null)
-                    {
-                        t = entry.transaction;
-                    }
-                    else
-                    {
-                        if (t.applied != 0)
-                        {
-                            PendingTransactions.pendingTransactions.RemoveAll(x => x.transaction.id.SequenceEqual(t.id));
-                            continue;
-                        }
-                    }
-
-                    // if transaction expired, remove it from pending transactions
-                    if (last_block_height > ConsensusConfig.getRedactedWindowSize()
-                        && t.blockHeight < last_block_height - ConsensusConfig.getRedactedWindowSize())
-                    {
-                        Logging.error("Error sending the transaction {0}, expired", t.getTxIdString());
-                        PendingTransactions.pendingTransactions.RemoveAll(x => x.transaction.id.SequenceEqual(t.id));
-                        continue;
-                    }
-
-                    if (entry.rejectedNodeList.Count() > 3
-                        && entry.rejectedNodeList.Count() > entry.confirmedNodeList.Count())
-                    {
-                        Logging.error("Error sending the transaction {0}, rejected", t.getTxIdString());
-                        PendingTransactions.pendingTransactions.RemoveAll(x => x.transaction.id.SequenceEqual(t.id));
-                        continue;
-                    }
-
-                    if (cur_time - tx_time > 60) // if the transaction is pending for over 60 seconds, resend
-                    {
-                        Logging.warn("Transaction {0} pending for a while, resending", t.getTxIdString());
-                        foreach (var address in entry.relayNodeAddresses)
-                        {
-                            NetworkClientManager.sendToClient(address, ProtocolMessageCode.transactionData2, t.getBytes(true, true), null);
-                        }
-                        CoreProtocolMessage.broadcastGetTransaction(t.id, 0);
-                        entry.addedTimestamp = cur_time;
-                        entry.confirmedNodeList.Clear();
-                        entry.rejectedNodeList.Clear();
-                    }
-                }
             }
         }
     }

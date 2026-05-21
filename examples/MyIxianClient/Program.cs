@@ -19,12 +19,18 @@ namespace IxianClient
             
             Console.CancelKeyPress += (sender, e) => {
                 e.Cancel = true;
-                IxianHandler.forceShutdown = true;
+                IxianHandler.requestShutdown();
             };
 
             try
             {
                 node = new Node();
+
+                if (IxianHandler.forceShutdown)
+                {
+                    return;
+                }
+
                 node.Start();
                                 
                 // Display initial state
@@ -132,13 +138,13 @@ namespace IxianClient
                                 {
                                     Console.WriteLine("\nAddress not found in local cache. Requesting sectors from network...");
                                     node?.RequestSector(presenceAddr);
-                                    Console.WriteLine("Waiting 1 seconds for network response...");
-                                    Thread.Sleep(1000);
+                                    Console.WriteLine("Waiting 2 seconds for network response...");
+                                    Thread.Sleep(2000);
 
                                     Console.WriteLine("\nRequesting Presence from network...");
                                     node?.RequestPresence(presenceAddr);
-                                    Console.WriteLine("Waiting 1 seconds for network response...");
-                                    Thread.Sleep(1000);
+                                    Console.WriteLine("Waiting 2 seconds for network response...");
+                                    Thread.Sleep(2000);
                                 }
 
                                 // Display presence information
@@ -160,6 +166,9 @@ namespace IxianClient
                         {
                             try
                             {
+                                CoreProtocolMessage.broadcastGetTransaction(Transaction.txIdLegacyToV8(txid), 0);
+                                Console.WriteLine("Waiting 2 seconds for network response...");
+                                Thread.Sleep(2000);
                                 var status = node?.GetTransactionStatus(txid) ?? "Unknown";
                                 Console.WriteLine($"\nTransaction status: {status}");
                             }
@@ -199,7 +208,7 @@ namespace IxianClient
 
                     case "7":
                         Console.WriteLine("\nShutting down...");
-                        IxianHandler.forceShutdown = true;
+                        IxianHandler.requestShutdown();
                         break;
 
                     default:

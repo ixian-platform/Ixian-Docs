@@ -9,6 +9,8 @@ The Common RPC API provides a foundational set of methods that are available on 
 
 All endpoints are accessible via `HTTP GET` or `HTTP POST` requests and follow the standard [JSON-RPC 2.0 specification](https://www.jsonrpc.org/specification).
 
+For a complete list of potential error responses, please refer to the [RPC Error Codes](./rpc_v0/errors) documentation.
+
 ---
 
 ## Node & Network Management
@@ -25,7 +27,7 @@ These methods are used to control the node's process and manage its P2P network 
 | [`clearPeerBlacklist`](./rpc_v0/node_clear-peer-blacklist) | Clears all entries from the peer blacklist. |
 | [`pauseClient`](./rpc_v0/node_pause-client) | Temporarily pauses a connected client. |
 | [`resumeClient`](./rpc_v0/node_resume-client) | Resumes a previously paused client connection. |
-| [`resumenetworkoperations`](./rpc_v0/node_resume-network-operations) | Resumes all network operations. |
+| [`resumeNetworkOperations`](./rpc_v0/node_resume-network-operations) | Resumes all network operations. |
 
 ---
 

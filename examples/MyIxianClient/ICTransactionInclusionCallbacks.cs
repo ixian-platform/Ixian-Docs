@@ -1,55 +1,57 @@
 ﻿using IXICore;
 using IXICore.Meta;
-using IXICore.Storage;
-using IXICore.Streaming;
+using IXICore.Activity;
+using System;
 using System.Linq;
 
 namespace IxianClient
 {
     internal class ICTransactionInclusionCallbacks : TransactionInclusionCallbacks
     {
-        public void receivedTIVResponse(Transaction tx, bool verified)
+        public void transactionVerified(Transaction tx)
         {
-            if (!verified)
-            {
-                tx.applied = 0;
-                return;
-            }
-            else
-            {
-                PendingTransactions.remove(tx.id);
-            }
-
-            TransactionCache.addTransaction(tx);
-            Friend friend = FriendList.getFriend(tx.pubKey);
-            if (friend == null)
-            {
-                foreach (var toEntry in tx.toList)
-                {
-                    friend = FriendList.getFriend(toEntry.Key);
-                    if (friend != null)
-                    {
-                        break;
-                    }
-                }
-            }
-
-            IxianHandler.balances.First().lastUpdate = 0;
+            var bh = IxianHandler.getBlockHeader(tx.applied);
+            Node.activityStorage.updateStatus(tx.id, ActivityStatus.Final, tx.applied, bh.timestamp);
         }
 
-        public void receivedBlockHeader(Block block_header, bool verified)
+        public void transactionRejected(Transaction tx)
         {
-            foreach (Balance balance in IxianHandler.balances)
+            tx.applied = 0;
+            Node.activityStorage.updateStatus(tx.id, ActivityStatus.Rejected, 0);
+        }
+
+        public void transactionExpired(Transaction tx)
+        {
+            tx.applied = 0;
+            Node.activityStorage.updateStatus(tx.id, ActivityStatus.Expired, 0);
+        }
+
+        public void transactionCannotVerify(Transaction tx)
+        {
+            tx.applied = 0;
+            Node.activityStorage.updateStatus(tx.id, ActivityStatus.Unknown, 0);
+        }
+
+        public void receivedBlockHeader(Block blockHeader, bool verified)
+        {
+            foreach (Balance balance in IxianHandler.balances.Values)
             {
-                if (balance.blockChecksum != null && balance.blockChecksum.SequenceEqual(block_header.blockChecksum))
+                if (balance.blockChecksum != null && balance.blockChecksum.SequenceEqual(blockHeader.blockChecksum))
                 {
                     balance.verified = true;
                 }
             }
 
-            if (block_header.blockNum >= IxianHandler.getHighestKnownNetworkBlockHeight())
+            IxianHandler.status = NodeStatus.ready;
+        }
+
+        public void blockReorg(Block blockHeader)
+        {
+            var revertedTransactions = Node.activityStorage.revertTransactionsByBlockHeight(blockHeader.blockNum);
+            foreach(var revertedTxId in revertedTransactions)
             {
-                IxianHandler.status = NodeStatus.ready;
+                var activity = Node.activityStorage.getActivityById(revertedTxId, null, true);
+                PendingTransactions.addOutgoingTransaction(activity.transaction, activity.transaction.toList.TakeLast(2).Select(x => x.Key).ToList());
             }
         }
     }
