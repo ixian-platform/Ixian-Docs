@@ -21,7 +21,7 @@ Requests can be made using either `HTTP POST` with a JSON body (recommended for 
 | Name         | Type     | Required | Description                                                                                                                              |
 | :----------- | :------- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------- |
 | `wallet`     | `string` | Yes      | The base58-encoded Ixian wallet address for which to retrieve activity.                                                                  |
-| `fromId`     | `string` | No       | The Base64-encoded `id` of the last activity from the previous page. Used for pagination. If omitted, the query starts from the latest activity. |
+| `fromId`     | `string` | No       | The `id` of the last activity from the previous page. Used for pagination. If omitted, the query starts from the latest activity. |
 | `count`      | `string` | No       | The maximum number of activity items to return. Defaults to `50`.                                                                        |
 | `type`       | `string` | No       | A string-encoded integer representing the `ActivityType` to filter by. If omitted, all activity types are returned.                      |
 | `descending` | `string` | No       | If set to `"true"`, results are returned in descending order (newest first). Defaults to `false` (ascending).                             |
@@ -147,6 +147,6 @@ This error is returned if the node is not configured to provide the `ActivitySto
 
 ## Behavioral Notes
 
-*   **Pagination:** To fetch the next page of results, take the `id` of the last item from the current result set, Base64-encode it, and use it as the `fromId` parameter in the next request.
+*   **Pagination:** To fetch the next page of results, take the `id` of the last item from the current result set, and use it as the `fromId` parameter in the next request.
 *   **Wallet Scope:** The query is always scoped to a single wallet's `seedHash`. The node derives the `seedHash` from the provided `wallet` address. An error will occur if the `wallet` parameter is missing or invalid.
 *   **Node Configuration:** This endpoint is only available on DLT nodes that have the `ActivityStorage` module enabled and fully synchronized.
