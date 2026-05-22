@@ -83,9 +83,8 @@ mqDriver = mqtt                     # or 'rabbitmq'
 mqHost = localhost
 mqPort = 1883
 
-
-# Streaming capabilities
-streamCapabilities = Incoming,Outgoing,IPN,Apps
+# Stream capabilities - set incoming (1) + apps (8) + app protocols (16) = 25
+streamCapabilities = 25
 
 # Logging
 logVerbosity = 14                   # 0=off, 1=trace, 2=info, 4=warn, 8=error
