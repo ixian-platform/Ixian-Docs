@@ -1,0 +1,97 @@
+---
+title: Group Chats Architecture
+description: Technical design and implementation details of decentralized group chats in the Ixian Platform, covering virtual addresses, privacy modes, and message routing.
+---
+
+## Introduction
+
+The Ixian Platform supports decentralized, peer-to-peer group chats natively through the S2 streaming network. Unlike traditional centralized chat applications where a server holds the group state and relays messages to participants, Ixian's group chats are distributed and leverage the underlying peer-to-peer mechanisms and cryptographic addresses.
+
+Group chats in Ixian are conceptually treated as specialized "Group" contacts (`FriendType.Group`) where the group itself acts as an entity with its own derived virtual address.
+
+---
+
+## Group Identity and Virtual Addresses
+
+To maintain a consistent identity for a group chat across all participants without relying on a central server, Ixian uses **Virtual Addresses**.
+
+A group's address is deterministically derived from the group creator's address and a random 16-byte identifier.
+
+### Address Derivation
+
+```csharp
+derivationBytes = creatorAddressNoChecksum || randomId
+hash = SHA3-512sqTrunc(derivationBytes)
+```
+
+The resulting hash is prefixed with a specific virtual address version byte (`1` for group addresses). This ensures that group addresses are structurally compatible with standard Ixian addresses but can be uniquely identified as virtual group entities.
+
+---
+
+## Group Creation
+
+When a user creates a group chat, a `CreateGroupMessage` is constructed and sent to the selected participants. 
+
+### CreateGroupMessage Structure
+
+The creation message (`SpixiMessageCode.createGroup`) contains the essential metadata required for participants to independently reconstruct the group state:
+- **`randomId`**: The 16-byte random identifier used for address derivation.
+- **`groupName`**: The human-readable name of the group.
+- **`participants`**: A list of invited addresses and their optional nicknames.
+- **`channels`**: Initial channels created within the group.
+- **`hideParticipantAddresses`**: A boolean flag indicating the privacy mode of the group.
+
+### Handshake and Playback Protection
+
+When a participant receives a `createGroup` message, their client derives the group address and checks if the group already exists. If it does, a `timestamp` check is performed to prevent playback attacks, ensuring an older group creation/handshake message cannot be replayed to reset the group state.
+
+---
+
+## Participant Privacy Modes
+
+Group chats support two privacy modes regarding participant visibility:
+
+### 1. Standard Mode (`hideParticipantAddresses = false`)
+All participants can see the actual Ixian wallet addresses of other participants. Peer-to-peer message routing can happen directly between any two participants in the group.
+
+### 2. Privacy Mode (`hideParticipantAddresses = true`)
+To protect user privacy in larger or public groups, the creator can choose to hide participant addresses. 
+In this mode, participants are represented by derived virtual addresses rather than their real Ixian addresses.
+
+```csharp
+participantVirtualAddress = DeriveGroupAddress(participantRealAddress, groupRandomId)
+```
+
+When sending messages in privacy mode, participants send their messages strictly to the group owner (creator). The group owner acts as a decentralized relay, forwarding the messages to other participants while masking the real sender addresses.
+
+---
+
+## Message Routing and Encapsulation
+
+Group chat communication utilizes the `SpixiMessage` encapsulation, which has been extended to include group-specific routing fields:
+- **`groupAddress`**: The virtual address of the group chat.
+- **`groupSenderAddress`**: The actual or virtual address of the participant who sent the message.
+
+### Routing Flow
+
+1. **Sender Construction**: A participant creates a `SpixiMessage` (e.g., `chat` or `chatStream`). The `groupAddress` is set to the group's virtual address.
+2. **Network Transmission**:
+   - In **Standard Mode**, the message is broadcast directly to all known participants using the standard S2 peer-to-peer network. If the sender doesn't have all group participants added as contacts, they can send the message to the group owner with `groupSenderAddress` set to their address. The group owner will then forward the message to all participants, including the original sender.
+   - In **Privacy Mode**, the message is sent only to the group creator. The creator verifies the message, replaces the sender's real address with their derived virtual address, and multicasts it to the rest of the participants.
+3. **Receiver Processing**: The receiving client inspects the `groupAddress` field. Instead of mapping the message to a 1-on-1 direct message, it routes the payload to the corresponding group chat interface.
+
+### Supported Group Messages
+Group chats support a variety of standard `SpixiMessageCode` operations, natively mapped to the group context:
+- Text messages (`chat`, `chatStream`)
+- Reactions (`msgReaction`)
+- Message deletions (`msgDelete`)
+- Read/Receive receipts (`msgRead`, `msgReceived`)
+- File sharing (`fileHeader`, `fileData`, etc.)
+- Spixi Mini Apps (`appData`, `appProtocolData`, etc.)
+- Leaving the group (`leave`)
+
+---
+
+## Conclusion
+
+By leveraging deterministic virtual addresses and the robust S2 streaming layer, Ixian provides a fully decentralized group chat architecture. This design eliminates the need for centralized servers while offering flexible privacy controls and seamless integration with existing peer-to-peer messaging capabilities.

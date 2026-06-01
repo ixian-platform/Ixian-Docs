@@ -1,0 +1,49 @@
+---
+title: chatStream (53)
+description: A streaming chat message that supports incremental content delivery and in-place updates.
+---
+
+The `chatStream` message is used to send chat content that can be delivered incrementally - for example, when streaming AI-generated responses or progressively building a long message. Unlike the standard `chat` message (code `0`), which delivers content in a single atomic payload, `chatStream` carries a structured `ChatStreamMessage` object that enables the recipient to assemble the final message from multiple sequential chunks.
+
+This message is sent within a `SpixiMessage` envelope with code `53`. It follows the same encrypted `StreamMessage` transport as a standard chat message.
+
+### Core Data Types
+
+*   **`IxiBytes`**: See **[IxiBytes Encoding](../../10_data-structures/ixi-bytes)**.
+*   **`IxiVarUInt`**: See **[IxiVarInt Encoding](../../10_data-structures/ixi-varint)**.
+*   **`string`**: A standard UTF-8 encoded string, serialized as `IxiBytes` (length-prefixed byte array).
+
+## Payload Structure
+
+The `data` field of the `SpixiMessage` is a serialized `ChatStreamMessage` with the following fields, in order:
+
+| Field | Data Type | Min | Max | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `messageId` | `IxiBytes` | 0 | 16 bytes | A unique identifier for this message. All chunks belonging to the same logical message share the same `messageId`. Maximum size is defined by `CoreConfig.maxMessageIdSize` (16 bytes). |
+| `message` | `IxiBytes` (UTF-8) | 0 | 64,000 bytes | The UTF-8 encoded text content of this chunk. The maximum size per chunk and for the fully assembled message is defined by `CoreConfig.maxChatMessageSize` (64,000 bytes). |
+| `sequence` | `IxiVarUInt` | 0 | * | A monotonically increasing sequence number. The first chunk of a new message must have sequence `0`. Each subsequent chunk must increment by exactly `1`. |
+| `isStream` | `byte` | `0` | `1` | A boolean flag (`1` = streaming, `0` = complete). When `1`, the `message` field contains a chunk to be **appended** to the existing content. When `0`, the `message` field contains a **replacement** for the full message content. |
+
+## Assembly Rules
+
+The recipient assembles the final message from `chatStream` chunks according to the following rules:
+
+1.  **New message (`messageId` not seen before):**
+    *   If `isStream` is `true`, `sequence` **must** be `0`. The message is stored as an initial chunk.
+    *   If `isStream` is `false`, the message is stored as a complete, standalone message.
+
+2.  **Existing message (`messageId` already received):**
+    *   If `isStream` is `true` and `sequence == previousSequence + 1`: the `message` content is **appended** to the existing text. The combined message must not exceed `maxChatMessageSize`.
+    *   If `isStream` is `false` and `sequence > previousSequence`: the `message` content **replaces** the existing text entirely, acting as a correction or final version.
+    *   If `sequence <= previousSequence`: the chunk is considered a duplicate and is **rejected**.
+    *   If `sequence > previousSequence + 1` (gap): the chunk is **rejected** as invalid.
+
+3.  **Sender validation:** If a message already exists from one sender, stream updates from a different `senderAddress` are rejected.
+
+## Behavioral Notes
+
+*   **Sending:** The client constructs a `ChatStreamMessage`, serializes it via `getBytes()`, wraps it in a `SpixiMessage` with type `chatStream` (53), and sends it through `sendSpixiMessage`. Unlike `sendChatMessage`, no explicit `id` is passed to the outer `StreamMessage`; the message identity is carried inside the `ChatStreamMessage.MessageId`.
+*   **Receive Confirmation:** Delivery confirmation for `chatStream` is deferred - the `msgReceived` confirmation is not sent automatically upon reception (same behavior as `chat`). The application layer processes the chunk first.
+*   **Group Chat:** `chatStream` is fully supported in group chats. It is included in the group message allowlist and is forwarded to all group participants by the group owner using the same broadcast mechanism as `chat`.
+*   **Size Limits:** Each individual chunk's `message` field is validated against `maxChatMessageSize` (64,000 bytes). The combined assembled message is also validated against the same limit on the recipient side; any chunk that would cause the total to exceed this limit is rejected.
+*   **Context:** The `channel` field in the `SpixiMessage` envelope indicates which conversation thread the message belongs to, identical to the standard `chat` message behavior.

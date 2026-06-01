@@ -27,6 +27,7 @@ The following messages are carried within the `SpixiMessage` payload.
 | [requestAdd2](./streaming/contact_request-add-2) | `40` | A request to add a user as a contact. |
 | [acceptAdd2](./streaming/contact_accept-add-2) | `41` | Accepts a contact request. |
 | [keys2](./streaming/contact_keys-2) | `42` | Exchanges session keys for end-to-end encryption. |
+| [createGroup](./streaming/contact_create-group) | `52` | Instructs participants to join a peer-to-peer group chat. |
 | [leave](./streaming/contact_leave) | `37` | A notification that a user is leaving a group chat. |
 | [leaveConfirmed](./streaming/contact_leave-confirmed)| `38`| Confirmation that the leave request was processed. |
 | [getPubKey](./streaming/contact_get-pub-key)| `26` | Requests the public key of a contact. |
@@ -41,6 +42,7 @@ The following messages are carried within the `SpixiMessage` payload.
 | Name | Code | Description |
 | :--- | :--- | :--- |
 | [chat](./streaming/msg-chat) | `0` | A standard text chat message. |
+| [chatStream](./streaming/msg-chat-stream) | `53` | A streaming chat message with incremental content delivery. |
 | [msgRead](./streaming/msg-read) | `8` | Confirmation that a message has been read. |
 | [msgReceived](./streaming/msg-received)| `9` | Confirmation that a message has been delivered. |
 | [msgDelete](./streaming/msg-delete)| `33`| A request to delete a previously sent message. |

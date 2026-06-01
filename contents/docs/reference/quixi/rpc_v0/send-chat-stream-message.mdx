@@ -1,0 +1,194 @@
+---
+title: sendChatStreamMessage
+description: Sends an end-to-end encrypted streaming chat message to an approved contact, with support for message continuation and real-time token streaming.
+status: Finalized
+---
+
+## Introduction
+
+The `sendChatStreamMessage` method is an advanced messaging endpoint designed for streaming or multi-part chat scenarios over the Ixian S2 network. Unlike `sendChatMessage`, which sends a single, complete message, this method wraps messages in a `ChatStreamMessage` envelope that supports **message identifiers**, **sequence numbers**, and an **`isStream` flag**.
+
+This makes it suitable for use cases such as AI-assisted chat responses, live transcription, or any scenario where a single logical message is delivered incrementally - one chunk at a time. When called, the message is saved to local history, wrapped into a `ChatStreamMessage`, and dispatched encrypted over the S2 streaming layer.
+
+---
+
+## Request
+
+Requests can be made using either `HTTP POST` with a JSON body or `HTTP GET` with URL query parameters.
+
+### Parameters
+
+| Name | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `address` | `string` | Yes | The Base58-encoded Ixian wallet address of the recipient contact. |
+| `message` | `string` | Yes | The plain-text content (or content chunk) of the message to be sent. |
+| `channel` | `integer`| Yes | The communication channel ID to send the message on (e.g., `0` for primary chat). |
+| `isStream` | `boolean`| No | Set to `true` to indicate that this message is part of an ongoing stream (i.e., more chunks will follow). Set to `false` or omit to indicate a full message. Defaults to `false`. |
+| `messageId` | `string` | No | A Base64-encoded identifier that groups multiple stream chunks into a single logical message. If omitted on the first call, a new unique ID is generated automatically. Subsequent chunks for the same logical message must include this ID. |
+| `sequence` | `integer`| No | The explicit sequence number for this chunk within the stream. If `messageId` is provided but `sequence` is omitted, QuIXI automatically increments the sequence based on the last known chunk for that message. |
+
+### Example POST Request (Initial stream chunk)
+
+```json
+POST /sendChatStreamMessage
+Content-Type: application/json
+
+{
+  "method": "sendChatStreamMessage",
+  "params": {
+    "address": "1EXSqPpj49ZmKiWF8stsMsMXVnSfkee7EzTaBakwNn9sJdaWm",
+    "message": "The answer to your question is",
+    "channel": 0,
+    "isStream": true
+  },
+  "id": 1
+}
+```
+
+### Example POST Request (Continuation chunk)
+
+Use the `messageId` returned from the initial chunk's `FriendMessage` response to append subsequent parts:
+
+```json
+POST /sendChatStreamMessage
+Content-Type: application/json
+
+{
+  "method": "sendChatStreamMessage",
+  "params": {
+    "address": "1EXSqPpj49ZmKiWF8stsMsMXVnSfkee7EzTaBakwNn9sJdaWm",
+    "message": " as follows: ...",
+    "channel": 0,
+    "isStream": true,
+    "messageId": "AAECBQY..."
+  },
+  "id": 2
+}
+```
+
+### Example POST Request (Final chunk)
+
+Set `isStream` to `false` (or omit it) on the last chunk to signal the end of the stream:
+
+```json
+POST /sendChatStreamMessage
+Content-Type: application/json
+
+{
+  "method": "sendChatStreamMessage",
+  "params": {
+    "address": "1EXSqPpj49ZmKiWF8stsMsMXVnSfkee7EzTaBakwNn9sJdaWm",
+    "message": " That is the complete answer.",
+    "channel": 0,
+    "isStream": false,
+    "messageId": "AAECBQY..."
+  },
+  "id": 3
+}
+```
+
+### Example GET Request
+
+```
+GET /sendChatStreamMessage?address=1EXSqPpj49ZmKiWF8stsMsMXVnSfkee7EzTaBakwNn9sJdaWm&message=Hello!&channel=0&isStream=false
+```
+
+---
+
+## Response
+
+If successful, the `result` is the `FriendMessage` object that was created and stored locally for this chunk.
+
+### Result: `FriendMessage` Object
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `id` | `string` | Base64-encoded unique identifier for this message. Use this value as `messageId` in subsequent stream chunks. |
+| `message` | `string` | The text content of this chunk. |
+| `timestamp` | `long` | Unix timestamp of when the message was created. |
+| `localSender` | `boolean` | `true` if the message was sent by the local node. |
+| `read` | `boolean` | Whether the message has been marked as read. |
+| `confirmed` | `boolean` | Whether the message delivery has been confirmed by the network. |
+| `sent` | `boolean` | Whether the message has been dispatched to a relay or offline server. |
+| `type` | `integer` | The message type. `0` corresponds to `standard`. |
+| `sequence` | `integer` | The sequence number of this chunk within the stream. |
+| `senderAddress` | `object\|null` | The sender's address object, or `null` for locally originated messages. |
+
+### Example Success Response
+
+```json
+{
+  "result": {
+    "id": "AAECBQY...",
+    "message": "The answer to your question is",
+    "timestamp": 1748802475,
+    "localSender": true,
+    "read": false,
+    "confirmed": false,
+    "sent": false,
+    "type": 0,
+    "sequence": 0,
+    "senderAddress": null,
+    "senderNick": "",
+    "transactionId": "",
+    "payableDataLen": 30,
+    "reactions": {}
+  },
+  "id": 1,
+  "error": null
+}
+```
+
+### Example Error Responses
+
+If the contact does not exist:
+
+```json
+{
+    "result": null,
+    "id": 1,
+    "error": {
+        "code": -32602,
+        "message": "contact doesn't exist"
+    }
+}
+```
+
+If a required parameter like `message` is missing:
+
+```json
+{
+    "result": null,
+    "id": 1,
+    "error": {
+        "code": -32602,
+        "message": "message parameter is missing"
+    }
+}
+```
+
+If a `messageId` is provided that does not exist and the `sequence` is greater than `0`:
+
+```json
+{
+    "result": null,
+    "id": 1,
+    "error": {
+        "code": -32602,
+        "message": "messageId doesn't exist or sequence is missing"
+    }
+}
+```
+
+---
+
+## Behavioral Notes
+
+*   **Prerequisite:** A secure communication channel must be fully established with the contact before messages can be sent. The contact must exist in the local friend list and have a status of `approved`.
+*   **Streaming Model:** The `isStream` flag tells the recipient whether additional chunks are expected. A client rendering a streaming response should treat `isStream: true` as "this message is still being generated" and `isStream: false` as "the message is complete." The recipient can use the `messageId` and `sequence` fields to assemble chunks in order.
+*   **Automatic Sequencing:** When `messageId` is provided without an explicit `sequence`, the node looks up the existing message by ID and automatically sets the sequence to `lastSequence + 1`. This simplifies stream continuation - you only need to pass the `messageId`.
+*   **Dual End-to-End Encryption:** Like `sendChatMessage`, the message content is encrypted locally using established session keys before being transmitted. Only the intended recipient can decrypt it.
+*   **Local Persistence:** Each stream chunk is individually saved to the node's local message history for the specified contact and channel. A successful API response confirms the chunk has been queued for sending.
+*   **Channels:** Channels are logical streams within a single contact connection, allowing for different types of communication (e.g., chat, file transfers, application data) to be multiplexed. Channel `0` is typically used for standard text chat.
+*   **Asynchronous Delivery:** Network delivery is asynchronous. The actual time of delivery depends on network conditions and the recipient's online status.
+*   **Comparison with `sendChatMessage`:** Use `sendChatMessage` for simple, one-shot messages. Use `sendChatStreamMessage` when you need to deliver content incrementally or need explicit control over message identity and sequencing.

@@ -7,13 +7,19 @@ A `SpixiMessage` is the application-level payload carried within the encrypted `
 
 ### Serialization Structure
 
-A `SpixiMessage` is a simple, typed data container.
+A `SpixiMessage` is serialized as a binary structure using a `BinaryWriter`. Fields are written sequentially and read back with a `BinaryReader`.
 
-| Field | Data Type | Min | Max | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `type` | `int32` | | | The `SpixiMessageCode` that defines the purpose and structure of the `data` field. |
-| `data` | `IxiBytes` | | | The SpixiMessage payload for this message type. |
-| `channel`| `int32` | | | An identifier for a specific chat channel. |
+| Field | Data Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `type` | `int32` | Yes | The `SpixiMessageCode` that defines the purpose and structure of the `data` field. |
+| `dataLength` | `int32` | Yes | The byte length of the `data` field. A value of `0` indicates no payload. |
+| `data` | `byte[]` | No | The SpixiMessage payload for this message type. Present only if `dataLength > 0`. |
+| `channel`| `int32` | No | An identifier for a specific chat channel. Defaults to `0` if not present. Read only if remaining bytes are available. |
+| `groupAddress` | `IxiBytes` | No | The address of the group this message belongs to. Present only for group messages. Read only if remaining bytes are available. |
+| `groupSenderAddress` | `IxiBytes` | No | The address of the original sender within a group. Used by the group owner when forwarding messages to other participants, and when `hideParticipantAddresses` mode is active. Sender can set this value to their address and send it to the group owner, to indicate that it needs to be forwarded to other group participants (this is useful when the sender doesn't have all group participants added as contacts). Read together with `groupAddress`. |
+
+> [!NOTE]
+> The `channel`, `groupAddress`, and `groupSenderAddress` fields are optional during deserialization for backward compatibility. The deserializer checks for remaining bytes before attempting to read each field.
 
 ---
 
@@ -21,16 +27,21 @@ A `SpixiMessage` is a simple, typed data container.
 
 The `type` field determines how the `data` payload should be interpreted. The following codes are defined.
 
-### Chat & Profile
+### Chat & Streaming
 
 | Code | Name | Description |
 | :--- | :--- | :--- |
 | 0 | `chat` | A standard text chat message. |
+| 53 | `chatStream` | A streaming chat message with incremental content delivery. |
+
+### Profile
+
+| Code | Name | Description |
+| :--- | :--- | :--- |
 | 1 | `getNick` | Requests the nickname of a contact. |
 | 2 | `nick` | Provides the nickname of a contact. |
 | 24 | `avatar` | Sends an avatar image. |
 | 25 | `getAvatar`| Requests the avatar for a contact. |
-| 35 | `msgTyping`| Indicates that the user is currently typing a message. |
 
 ### Messaging Status & Reactions
 
@@ -40,6 +51,7 @@ The `type` field determines how the `data` payload should be interpreted. The fo
 | 9 | `msgReceived`| Confirmation that a message has been delivered to the recipient's device. |
 | 33 | `msgDelete`| A request to delete a previously sent message. |
 | 34 | `msgReaction`| Adds a reaction (e.g., an emoji) to a specific message. |
+| 35 | `msgTyping`| Indicates that the user is currently typing a message. |
 | 36 | `msgError` | Reports an error in processing a previous message. |
 | 39 | `msgReport` | Reports a message for moderation or abuse (e.g. for group servers/bots). |
 
@@ -52,17 +64,26 @@ The `type` field determines how the `data` payload should be interpreted. The fo
 | 38 | `leaveConfirmed`| Confirmation that the leave request was processed. |
 | 40 | `requestAdd2` | A request to add a user as a contact. |
 | 41 | `acceptAdd2` | Accepts a contact request. |
+| 42 | `keys2` | Exchanges session keys for end-to-end encryption. |
 | 26 | `getPubKey`| Requests the public key of a contact. |
 | 27 | `pubKey` | Provides a public key in response to a request. |
-| 42 | `keys2` | Exchanges session keys for end-to-end encryption. |
+| 52 | `createGroup` | Instructs participants to join a peer-to-peer group chat. |
 
-### Funds & Transactions
+### Transactions
 
 | Code | Name | Description |
 | :--- | :--- | :--- |
-| 5 | `sentFunds` | A notification that funds have been sent. |
-| 6 | `requestFunds`| A request for a payment from a contact. |
-| 18 | `requestFundsResponse`| The response to a `requestFunds` message. |
+| 49 | `transactionRequest` | A request to initiate a transaction with a peer. |
+| 48 | `transactionSend` | Sends transaction data to a peer. |
+| 46 | `transactionSendRequest` | A request to send a transaction via the peer's node. |
+| 47 | `transactionSendResponse` | The response to a `transactionSendRequest`. |
+
+### Secure Connections
+
+| Code | Name | Description |
+| :--- | :--- | :--- |
+| 50 | `openSecureConnection` | Opens a direct secure (IXI Socket) connection with a peer. |
+| 51 | `closeSecureConnection` | Closes an active secure connection. |
 
 ### File Transfer
 
@@ -103,6 +124,17 @@ The `type` field determines how the `data` payload should be interpreted. The fo
 | :--- | :--- | :--- |
 | 20 | `botGetMessages`| A request used by a bot to fetch messages from a channel. |
 | 32 | `botAction`| A generic action or command sent to a bot. |
+
+### Deprecated
+
+| Code | Name | Description |
+| :--- | :--- | :--- |
+| 3 | `requestAdd` | Legacy contact request. Superseded by `requestAdd2` (40). |
+| 4 | `acceptAdd` | Legacy contact accept. Superseded by `acceptAdd2` (41). |
+| 5 | `sentFunds` | Legacy funds notification. Deprecated in favor of `transactionRequest` (49). |
+| 6 | `requestFunds` | Legacy payment request. Deprecated in favor of `transactionSend` (48). |
+| 7 | `keys` | Legacy key exchange. Superseded by `keys2` (42). |
+| 18 | `requestFundsResponse` | Legacy response to `requestFunds`. |
 
 ### Reserved
 
