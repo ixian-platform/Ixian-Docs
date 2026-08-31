@@ -23,7 +23,6 @@ export const metadata: Metadata = {
   keywords: Settings.keywords,
   openGraph: {
     type: Settings.openGraph.type,
-    url: baseUrl,
     title: Settings.openGraph.title,
     description: Settings.openGraph.description,
     siteName: Settings.openGraph.siteName,
@@ -41,9 +40,6 @@ export const metadata: Metadata = {
       ...image,
       url: `${baseUrl}${image.url}`,
     })),
-  },
-  alternates: {
-    canonical: baseUrl,
   },
 }
 
